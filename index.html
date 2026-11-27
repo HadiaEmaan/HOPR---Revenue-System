@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#062a4d">
+  <title>HOPR Clinic Desk | PMS</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <section class="auth-screen" id="loginScreen" aria-labelledby="loginTitle">
+    <div class="auth-brand"><span class="brand-mark"><img class="brand-logo-image" src="/hopr.jpeg" alt="HOPR logo"></span><span class="brand-copy"><strong>HOPR</strong><small>CLINIC DESK</small></span></div>
+    <div class="auth-content">
+      <p class="eyebrow">STAFF WORKSPACE</p>
+      <h1 id="loginTitle">Welcome back.</h1>
+      <p class="auth-subtitle">Sign in with your clinic account to continue.</p>
+      <form id="loginForm" class="login-form">
+        <label class="field">Work email<input name="email" type="email" autocomplete="username" required maxlength="160" placeholder="name@clinic.com"></label>
+        <label class="field">Password<input name="password" type="password" autocomplete="current-password" required maxlength="256" placeholder="Enter your password"></label>
+        <p class="auth-error" id="loginError" role="alert" hidden></p>
+        <button class="button primary-button login-submit" id="loginSubmit" type="submit">Sign in <span></span></button>
+      </form>
+      <form id="setupForm" class="login-form" hidden>
+        <p class="eyebrow">FIRST-TIME SETUP</p>
+        <h1 id="setupTitle">Create admin account.</h1>
+        <p class="auth-subtitle">This one-time step secures your clinic workspace.</p>
+        <label class="field">Full name<input name="name" autocomplete="name" required maxlength="80" placeholder="Your name"></label>
+        <label class="field">Work email<input name="email" type="email" autocomplete="username" required maxlength="160" placeholder="name@clinic.com"></label>
+        <label class="field">Password<input name="password" type="password" autocomplete="new-password" required minlength="14" maxlength="256" placeholder="At least 14 characters"></label>
+        <p class="auth-error" id="setupError" role="alert" hidden></p>
+        <button class="button primary-button login-submit" id="setupSubmit" type="submit">Create account <span></span></button>
+      </form>
+      <p class="auth-footnote">Accounts are issued by your clinic administrator.</p>
+    </div>
+    <div class="auth-decoration"><img src="/clinic.jpeg" alt="Inside the HOPR physiotherapy clinic"><span>HOPR</span><b>Care that<br>keeps you moving.</b><small>RAWALPINDI GYMKHANA · PHYSIOTHERAPY</small></div>
+  </section>
+
+  <div class="app-shell" id="appShell" hidden>
+    <aside class="sidebar" id="sidebar">
+      <a class="brand" href="#overview" aria-label="HOPR Clinic Desk home">
+        <span class="brand-mark"><img class="brand-logo-image" src="/hopr.jpeg" alt="HOPR logo"></span>
+        <span class="brand-copy"><strong>HOPR</strong><small>CLINIC DESK</small></span>
+      </a>
+      <div class="clinic-switch"><span class="clinic-dot"></span><span><b>Rawalpindi Gymkhana</b><small>Physiotherapy clinic</small></span><span class="chevron">⌄</span></div>
+      <p class="nav-label">WORKSPACE</p>
+      <nav class="nav-list" id="navigation" aria-label="Main navigation"></nav>
+      <div class="sidebar-bottom">
+        <div class="secure-note"><span class="secure-icon">✓</span><span><b>Clinic workspace</b><small>Authenticated session</small></span></div>
+        <button class="profile-button" type="button" id="profileButton"><span class="avatar" id="profileAvatar">SA</span><span><b id="profileName">Sara Ahmed</b><small id="profileRole">Clinic Admin</small></span><span class="chevron">···</span></button>
+      </div>
+    </aside>
+
+    <main class="main-area">
+      <header class="topbar">
+        <button class="icon-button mobile-menu" id="menuToggle" aria-label="Open navigation">☰</button>
+        <div class="breadcrumb"><span>HOPR</span><span class="slash">/</span><b id="breadcrumbCurrent">Overview</b></div>
+        <div class="top-actions">
+          <span class="live-indicator"><i></i> Clinic open</span>
+          <span class="role-label" id="roleLabel">Clinic staff</span>
+          <button class="button secondary-button" id="changePasswordButton" type="button">Change password</button>
+          <button class="button secondary-button signout-button" id="signoutButton" type="button">Sign out</button>
+        </div>
+      </header>
+
+      <div class="page-content">
+        <section class="page-heading">
+          <div><p class="eyebrow" id="dateLabel">MONDAY, 19 OCTOBER 2026</p><h1 id="pageTitle">Good morning, Sara <span class="wave">.</span></h1><p class="page-subtitle" id="pageSubtitle">Here’s what’s happening across your clinic today.</p></div>
+          <div class="heading-actions" id="headingActions"></div>
+        </section>
+
+        <section class="workspace-view" id="workspaceView" hidden></section>
+
+        <section class="metrics-grid" id="metrics" aria-label="Clinic summary"></section>
+
+        <section class="content-grid">
+          <article class="panel schedule-panel" id="primaryPanel">
+            <div class="panel-heading"><div><p class="eyebrow">YOUR CLINIC, AT A GLANCE</p><h2 id="primaryTitle">Today’s appointments</h2></div><button class="text-button" id="viewAllButton">View schedule <span></span></button></div>
+            <div class="schedule-toolbar"><div class="date-control"><button id="previousSchedule" type="button" aria-label="Previous day">‹</button><b id="scheduleDateLabel">Today</b><button id="nextSchedule" type="button" aria-label="Next day">›</button></div><div class="view-toggle" role="group" aria-label="Schedule range"><button id="dayViewButton" class="selected" type="button" aria-pressed="true">Day</button><button id="weekViewButton" type="button" aria-pressed="false">Week</button></div></div>
+            <div class="appointment-list" id="appointmentList"></div>
+          </article>
+
+          <aside class="right-column">
+            <article class="panel queue-panel" id="queuePanel">
+              <div class="panel-heading compact"><div><p class="eyebrow">LIVE FRONT DESK</p><h2>Waiting room <span class="count-pill" id="queueCount">0</span></h2></div><button class="more-button" aria-label="More queue actions">···</button></div>
+              <div class="queue-list" id="queueList"></div>
+              <button class="queue-action" id="queueAction">Open queue <span></span></button>
+            </article>
+            <article class="panel insight-panel" id="insightPanel">
+              <div class="panel-heading compact"><div><p class="eyebrow" id="insightEyebrow">CLINIC PULSE</p><h2 id="insightTitle">Patient visits</h2></div><button class="more-button" aria-label="More insights">···</button></div>
+              <div class="chart-summary"><strong id="chartTotal">128</strong><span class="trend positive" id="chartTrend">↑ 12.8%</span><small id="chartCaption">vs. previous week</small></div>
+              <div class="chart" id="chart" role="img" aria-label="Patient visits over the last seven days"></div>
+              <div class="chart-days"><span>Mon</span><span>Tue</span><span>Wed</span><span>Thu</span><span>Fri</span><span>Sat</span><span>Sun</span></div>
+            </article>
+          </aside>
+        </section>
+
+        <section class="bottom-grid">
+          <article class="panel bottom-panel" id="secondaryPanel">
+            <div class="panel-heading compact"><div><p class="eyebrow" id="secondaryEyebrow">TEAM PERFORMANCE</p><h2 id="secondaryTitle">Doctor utilisation</h2></div><button class="text-button" id="secondaryAction">This week <span>⌄</span></button></div>
+            <div id="secondaryContent"></div>
+          </article>
+          <article class="panel bottom-panel activity-panel" id="activityPanel">
+            <div class="panel-heading compact"><div><p class="eyebrow">RECENT ACTIVITY</p><h2>Latest updates</h2></div><button class="more-button" aria-label="More activity">···</button></div>
+            <div class="activity-list" id="activityList"></div>
+          </article>
+        </section>
+        <footer class="page-footer"><span>HOPR Clinic Desk <span class="footer-dot">·</span> Internal workspace</span><span>Staff access only</span></footer>
+      </div>
+    </main>
+  </div>
+
+  <dialog class="modal" id="checkinModal" aria-labelledby="modalTitle">
+    <form id="checkinForm" method="dialog">
+      <div class="modal-header"><div><p class="eyebrow">FRONT DESK</p><h2 id="modalTitle">Register a patient</h2></div><button class="icon-button" type="button" id="closeModal" aria-label="Close form">×</button></div>
+      <p class="modal-copy">Add a visit to today’s clinic schedule.</p>
+      <div class="form-grid">
+        <label class="field full">Patient ID type<select id="registrationMode" name="registrationMode"><option value="membership">Gymkhana membership ID</option><option value="appointment">Appointment ID only (no membership)</option></select></label>
+        <label class="field">Patient name<input name="name" required maxlength="80" placeholder="e.g. Ayesha Khan"></label>
+        <label class="field" id="membershipField">Membership ID<input id="membershipIdInput" name="membershipId" required maxlength="64" autocomplete="off" placeholder="Enter member ID"></label>
+        <label class="field" id="appointmentIdField" hidden>Appointment ID<input name="appointmentIdPreview" readonly placeholder="Generated after saving"></label>
+        <label class="field">Phone number<input name="phone" required inputmode="tel" maxlength="24" placeholder="03xx xxx xxxx"></label>
+        <label class="field">Age<input name="age" type="number" min="0" max="130" placeholder="Optional"></label>
+        <label class="field">Assigned doctor<select name="doctor"><option>Dr. Ayesha Malik</option><option>Dr. Hamza Raza</option><option>Dr. Sara Ahmed</option></select></label>
+        <label class="field" id="sessionsPrescribedField">Sessions prescribed<input name="sessionsPrescribed" type="number" min="1" max="100" step="1" inputmode="numeric" placeholder="Doctor's plan, e.g. 10"></label>
+        <label class="field">Visit type<select name="visit"><option>Consultation</option><option>New patient</option><option>Follow-up</option></select></label>
+        <label class="field">Pain area / condition<input name="condition" maxlength="80" placeholder="e.g. Shoulder pain"></label>
+        <label class="field">Appointment date<input name="date" type="date" required></label>
+        <label class="field">Appointment time<input name="time" type="time" required></label>
+        <label class="field">Payment method<select name="payment"><option>Cash</option><option>Online</option><option>POS</option></select></label>
+        <label class="field">Payment status<select name="paymentStatus"><option>Paid</option><option>Unpaid</option></select></label>
+        <label class="field">Amount (PKR)<input name="amount" type="number" min="0" step="50" value="0" required></label>
+      </div>
+      <div class="member-history" id="memberHistory" aria-live="polite" hidden></div>
+      <p class="form-notice" id="appointmentOnlyNotice" hidden>No Gymkhana membership ID is available. The system will generate an appointment ID for the doctor to use in clinical notes.</p>
+      <p class="form-notice">Patient information is stored in the clinic database and visible only to authorized roles.</p>
+      <div class="modal-actions"><button class="button secondary-button" type="button" id="cancelModal">Cancel</button><button class="button primary-button" type="submit">Add patient <span></span></button></div>
+    </form>
+  </dialog>
+  <dialog class="modal" id="noteModal" aria-labelledby="noteModalTitle">
+    <form id="noteForm" method="dialog">
+      <div class="modal-header"><div><p class="eyebrow">CLINICAL RECORD</p><h2 id="noteModalTitle">Add session note</h2></div><button class="icon-button" type="button" id="closeNoteModal" aria-label="Close form">×</button></div>
+      <p class="modal-copy">Notes are limited to your assigned patients and clinic administrators.</p>
+      <div class="form-grid">
+        <label class="field">Search by<select id="noteLookupType" name="lookupType"><option value="appointment">Appointment ID</option><option value="membership">Membership ID</option></select></label>
+        <label class="field" id="noteLookupLabel">Appointment ID<input id="noteAppointmentNumber" name="lookupNumber" required inputmode="text" autocomplete="off" placeholder="Enter appointment ID, e.g. 1278"></label>
+        <label class="field full" id="memberAppointmentField" hidden>Appointment for this session<select id="memberAppointmentSelect" name="memberAppointment"></select></label>
+        <input name="appointmentId" type="hidden">
+        <div class="member-history" id="appointmentNoteHistory" aria-live="polite" hidden></div>
+        <label class="field full">Session note<textarea name="note" required maxlength="4000" placeholder="Record the assessment and session outcome."></textarea></label>
+        <label class="field full">Treatment plan<textarea name="treatmentPlan" maxlength="2000" placeholder="Next steps and home exercise plan."></textarea></label>
+        <label class="field">Recommended next visit<input name="nextVisit" type="date"></label>
+      </div>
+      <div class="modal-actions"><button class="button secondary-button" type="button" id="cancelNoteModal">Cancel</button><button class="button primary-button" type="submit">Save note <span></span></button></div>
+    </form>
+  </dialog>
+  <dialog class="modal" id="changePasswordModal" aria-labelledby="changePasswordTitle">
+    <form id="changePasswordForm">
+      <div class="modal-header"><div><p class="eyebrow">ACCOUNT SECURITY</p><h2 id="changePasswordTitle">Change password</h2></div><button class="icon-button" type="button" id="closePasswordModal" aria-label="Close form">×</button></div>
+      <p class="modal-copy">Use a unique password with at least 14 characters. Other active sessions will be signed out.</p>
+      <div class="form-grid">
+        <label class="field full">Current password<input name="currentPassword" type="password" autocomplete="current-password" maxlength="256" required></label>
+        <label class="field full">New password<input name="newPassword" type="password" autocomplete="new-password" minlength="14" maxlength="256" required></label>
+        <label class="field full">Confirm new password<input name="confirmPassword" type="password" autocomplete="new-password" minlength="14" maxlength="256" required></label>
+      </div>
+      <p class="form-notice" id="passwordChangeError" role="alert" hidden></p>
+      <div class="modal-actions"><button class="button secondary-button" type="button" id="cancelPasswordModal">Cancel</button><button class="button primary-button" type="submit">Update password</button></div>
+    </form>
+  </dialog>
+  <dialog class="modal" id="resetStaffPasswordModal" aria-labelledby="resetStaffPasswordTitle">
+    <form id="resetStaffPasswordForm">
+      <div class="modal-header"><div><p class="eyebrow">STAFF ACCOUNT</p><h2 id="resetStaffPasswordTitle">Reset password</h2></div><button class="icon-button" type="button" id="closeStaffPasswordResetModal" aria-label="Close form">×</button></div>
+      <p class="modal-copy" id="resetStaffPasswordTarget"></p>
+      <div class="form-grid">
+        <label class="field full">New temporary password<input name="newPassword" type="password" autocomplete="new-password" minlength="14" maxlength="256" required></label>
+        <label class="field full">Confirm temporary password<input name="confirmPassword" type="password" autocomplete="new-password" minlength="14" maxlength="256" required></label>
+      </div>
+      <p class="form-notice" id="staffPasswordResetError" role="alert" hidden></p>
+      <div class="modal-actions"><button class="button secondary-button" type="button" id="cancelStaffPasswordResetModal">Cancel</button><button class="button primary-button" type="submit">Reset password</button></div>
+    </form>
+  </dialog>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="secure-app.js?v=admin-password-controls-20261127a"></script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+{
+  "name": "hopr-clinic-pms",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Role-based physiotherapy clinic management app",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "pdf-lib": "^1.17.1"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  }
+}
