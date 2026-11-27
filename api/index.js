@@ -7,7 +7,9 @@ module.exports = (request, response) => {
   const forwardedPath = url.searchParams.get('__pms_path');
   if (forwardedPath) {
     const originalUrl = new URL(forwardedPath, 'http://localhost');
-    if (originalUrl.origin === 'http://localhost' && originalUrl.pathname.startsWith('/api/')) {
+    if (originalUrl.origin === 'http://localhost'
+      && forwardedPath.startsWith('/')
+      && !forwardedPath.startsWith('//')) {
       url.searchParams.delete('__pms_path');
       request.url = `${originalUrl.pathname}${url.search}`;
     }

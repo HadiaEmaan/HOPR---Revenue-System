@@ -54,14 +54,15 @@ test('server enforces sessions, roles, doctor scope and audit masking', async t 
   }
   assert.equal(ready, true, `server did not start: ${serverError}`);
 
-  const request = async (url, { cookie, ...options } = {}) => {
+  const vercelFetch = async (url, options) => {
     const requestUrl = new URL(url, baseUrl);
-    if (requestUrl.pathname.startsWith('/api/')) {
-      const originalPath = requestUrl.pathname;
-      requestUrl.pathname = '/api/index';
-      requestUrl.searchParams.set('__pms_path', originalPath);
-    }
-    const response = await fetch(requestUrl, {
+    const originalPath = requestUrl.pathname;
+    requestUrl.pathname = '/api/index';
+    requestUrl.searchParams.set('__pms_path', originalPath);
+    return fetch(requestUrl, options);
+  };
+  const request = async (url, { cookie, ...options } = {}) => {
+    const response = await vercelFetch(url, {
       ...options,
       headers: { ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...(cookie ? { Cookie: cookie } : {}), ...options.headers }
     });
@@ -84,22 +85,24 @@ test('server enforces sessions, roles, doctor scope and audit masking', async t 
   assert.equal((await request('/api/dashboard')).response.status, 401);
   assert.equal((await request('/api/change-password', { method: 'POST', body: JSON.stringify({ currentPassword: 'x', newPassword: 'x'.repeat(14) }) })).response.status, 401);
   assert.equal((await request('/api/session')).response.status, 200);
-  assert.equal((await fetch(`${baseUrl}/server.js`)).status, 404);
-  assert.equal((await fetch(`${baseUrl}/api.test.js`)).status, 404);
-  assert.equal((await fetch(`${baseUrl}/data/clinic.sqlite`)).status, 404);
-  assert.equal((await fetch(baseUrl)).status, 200);
-  assert.equal((await fetch(`${baseUrl}/styles.css`)).status, 200);
-  assert.equal((await fetch(`${baseUrl}/Patient%20History%20%26%20Assessment%20Form.pdf`)).status, 404);
-  const clinicPhoto = await fetch(`${baseUrl}/clinic.jpeg`);
+  assert.equal((await vercelFetch(`${baseUrl}/server.js`)).status, 404);
+  assert.equal((await vercelFetch(`${baseUrl}/api.test.js`)).status, 404);
+  assert.equal((await vercelFetch(`${baseUrl}/data/clinic.sqlite`)).status, 404);
+  assert.equal((await vercelFetch(baseUrl)).status, 200);
+  assert.equal((await vercelFetch(`${baseUrl}/index.html`)).status, 200);
+  assert.equal((await vercelFetch(`${baseUrl}/styles.css`)).status, 200);
+  assert.equal((await vercelFetch(`${baseUrl}/secure-app.js`)).status, 200);
+  assert.equal((await vercelFetch(`${baseUrl}/Patient%20History%20%26%20Assessment%20Form.pdf`)).status, 404);
+  const clinicPhoto = await vercelFetch(`${baseUrl}/clinic.jpeg`);
   assert.equal(clinicPhoto.status, 200);
   assert.match(clinicPhoto.headers.get('content-type'), /image\/jpeg/);
-  const clinicLogo = await fetch(`${baseUrl}/hopr.jpeg`);
+  const clinicLogo = await vercelFetch(`${baseUrl}/hopr.jpeg`);
   assert.equal(clinicLogo.status, 200);
   assert.match(clinicLogo.headers.get('content-type'), /image\/jpeg/);
-  const invoiceTemplate = await fetch(`${baseUrl}/invoice.png`);
+  const invoiceTemplate = await vercelFetch(`${baseUrl}/invoice.png`);
   assert.equal(invoiceTemplate.status, 200);
   assert.match(invoiceTemplate.headers.get('content-type'), /image\/png/);
-  const gymkhanaLogo = await fetch(`${baseUrl}/gymkhana.png`);
+  const gymkhanaLogo = await vercelFetch(`${baseUrl}/gymkhana.png`);
   assert.equal(gymkhanaLogo.status, 200);
   assert.match(gymkhanaLogo.headers.get('content-type'), /image\/png/);
   assert.equal((await request('/api/setup-status')).body.setupRequired, true);
