@@ -2,45 +2,13 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "functions": {
     "api/index.js": {
-      "includeFiles": "{index.html,styles.css,secure-app.js,hopr.jpeg,gymkhana.png,invoice.png,clinic.jpeg,Patient History & Assessment Form.pdf}"
+      "includeFiles": "Patient History & Assessment Form.pdf"
     }
   },
   "rewrites": [
     {
-      "source": "/",
-      "destination": "/api/index?__pms_path=/"
-    },
-    {
-      "source": "/index.html",
-      "destination": "/api/index?__pms_path=/index.html"
-    },
-    {
       "source": "/api/:path*",
       "destination": "/api/index?__pms_path=/api/:path*"
-    },
-    {
-      "source": "/styles.css",
-      "destination": "/api/index?__pms_path=/styles.css"
-    },
-    {
-      "source": "/secure-app.js",
-      "destination": "/api/index?__pms_path=/secure-app.js"
-    },
-    {
-      "source": "/hopr.jpeg",
-      "destination": "/api/index?__pms_path=/hopr.jpeg"
-    },
-    {
-      "source": "/gymkhana.png",
-      "destination": "/api/index?__pms_path=/gymkhana.png"
-    },
-    {
-      "source": "/invoice.png",
-      "destination": "/api/index?__pms_path=/invoice.png"
-    },
-    {
-      "source": "/clinic.jpeg",
-      "destination": "/api/index?__pms_path=/clinic.jpeg"
     }
   ]
 }

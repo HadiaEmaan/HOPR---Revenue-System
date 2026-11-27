@@ -56,9 +56,11 @@ test('server enforces sessions, roles, doctor scope and audit masking', async t 
 
   const vercelFetch = async (url, options) => {
     const requestUrl = new URL(url, baseUrl);
-    const originalPath = requestUrl.pathname;
-    requestUrl.pathname = '/api/index';
-    requestUrl.searchParams.set('__pms_path', originalPath);
+    if (requestUrl.pathname.startsWith('/api/')) {
+      const originalPath = requestUrl.pathname;
+      requestUrl.pathname = '/api/index';
+      requestUrl.searchParams.set('__pms_path', originalPath);
+    }
     return fetch(requestUrl, options);
   };
   const request = async (url, { cookie, ...options } = {}) => {
