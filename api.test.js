@@ -24,8 +24,9 @@ test('server enforces sessions, roles, doctor scope and audit masking', async t 
   });
   let child;
   let serverError = '';
+  const serverBootstrap = "const http = require('node:http'); const handler = require('./api'); http.createServer(handler).listen(Number(process.env.PORT), process.env.HOST);";
   const startServer = () => {
-    const childProcess = spawn(process.execPath, [path.join(__dirname, 'server.js')], {
+    const childProcess = spawn(process.execPath, ['-e', serverBootstrap], {
       cwd: __dirname,
       env: { ...process.env, PORT: String(port), HOST: '0.0.0.0', PMS_DB_PATH: path.join(tempDir, 'clinic.sqlite'), NODE_ENV: 'test' },
       stdio: ['ignore', 'ignore', 'pipe']
@@ -54,7 +55,13 @@ test('server enforces sessions, roles, doctor scope and audit masking', async t 
   assert.equal(ready, true, `server did not start: ${serverError}`);
 
   const request = async (url, { cookie, ...options } = {}) => {
-    const response = await fetch(`${baseUrl}${url}`, {
+    const requestUrl = new URL(url, baseUrl);
+    if (requestUrl.pathname.startsWith('/api/')) {
+      const originalPath = requestUrl.pathname;
+      requestUrl.pathname = '/api/index';
+      requestUrl.searchParams.set('__pms_path', originalPath);
+    }
+    const response = await fetch(requestUrl, {
       ...options,
       headers: { ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...(cookie ? { Cookie: cookie } : {}), ...options.headers }
     });

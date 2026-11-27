@@ -7,8 +7,12 @@
   },
   "rewrites": [
     {
+      "source": "/",
+      "destination": "/index.html"
+    },
+    {
       "source": "/api/:path*",
-      "destination": "/api/index"
+      "destination": "/api/index?__pms_path=/api/:path*"
     }
   ]
 }
