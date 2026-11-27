@@ -15,6 +15,9 @@ const dbPath = process.env.PMS_DB_PATH || path.join(dataDir, 'clinic.sqlite');
 const assessmentTemplatePath = path.join(root, 'Patient History & Assessment Form.pdf');
 const port = Number(process.env.PORT || 7860);
 const host = process.env.HOST || '0.0.0.0';
+if (process.env.VERCEL && (!process.env.TURSO_DATABASE_URL || !process.env.TURSO_AUTH_TOKEN)) {
+  throw new Error('Vercel deployment requires TURSO_DATABASE_URL and TURSO_AUTH_TOKEN. Set both in Project Settings > Environment Variables, then redeploy.');
+}
 const databaseUrl = process.env.TURSO_DATABASE_URL || pathToFileURL(dbPath).href;
 const dbClient = createClient({
   url: databaseUrl,
@@ -115,9 +118,6 @@ const db = {
 };
 
 async function initializeSchema() {
-if (process.env.VERCEL && (!process.env.TURSO_DATABASE_URL || !process.env.TURSO_AUTH_TOKEN)) {
-  throw new Error('Set TURSO_DATABASE_URL and TURSO_AUTH_TOKEN in the Vercel project settings.');
-}
 if (!process.env.TURSO_DATABASE_URL && !process.env.VERCEL) fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 await dbClient.execute('PRAGMA foreign_keys = ON');
 await db.exec(`
