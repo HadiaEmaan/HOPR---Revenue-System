@@ -34,6 +34,8 @@ function createDatabase({ adminCount = 1 } = {}) {
     CREATE TABLE compliance_checks (id TEXT PRIMARY KEY, checked_by TEXT REFERENCES users(id));
     CREATE TABLE inventory_items (id TEXT PRIMARY KEY, updated_by TEXT REFERENCES users(id));
     CREATE TABLE audit_log (id TEXT PRIMARY KEY, actor_id TEXT REFERENCES users(id));
+    CREATE TABLE sessions (token_hash TEXT PRIMARY KEY, user_id TEXT REFERENCES users(id), expires_at INTEGER);
+    CREATE TABLE login_failures (address_hash TEXT PRIMARY KEY, failure_count INTEGER, window_expires_at INTEGER);
     INSERT INTO users VALUES ('admin-1', 'admin'), ('doctor-1', 'doctor'), ('manager-1', 'manager');
     INSERT INTO patients VALUES ('patient-1', 'manager-1');
     INSERT INTO appointments VALUES ('appointment-1', 'patient-1', 'doctor-1', 'manager-1');
@@ -47,9 +49,14 @@ function createDatabase({ adminCount = 1 } = {}) {
     INSERT INTO compliance_checks VALUES ('check-1', 'manager-1');
     INSERT INTO inventory_items VALUES ('item-1', 'manager-1');
     INSERT INTO audit_log VALUES ('audit-1', 'manager-1');
+    INSERT INTO sessions VALUES ('session-hash', 'admin-1', 9999999999999);
+    INSERT INTO login_failures VALUES ('address-hash', 2, 9999999999999);
   `);
   if (adminCount > 1) database.prepare("INSERT INTO users VALUES ('admin-2', 'admin')").run();
-  if (adminCount === 0) database.prepare("DELETE FROM users WHERE role = 'admin'").run();
+  if (adminCount === 0) {
+    database.prepare("DELETE FROM sessions WHERE user_id = 'admin-1'").run();
+    database.prepare("DELETE FROM users WHERE role = 'admin'").run();
+  }
   database.close();
   return { directory, databasePath };
 }
@@ -75,6 +82,8 @@ test('clears clinic data while preserving all accounts and unrelated files', () 
   for (const table of ['patients', 'appointments', 'invoices', 'patient_assessments', 'payments', 'appointment_references', 'clinical_notes', 'expenses', 'clinic_tasks', 'compliance_checks', 'inventory_items', 'audit_log']) {
     assert.equal(database.prepare(`SELECT COUNT(*) AS count FROM "${table}"`).get().count, 0, `${table} should be empty`);
   }
+  assert.equal(database.prepare('SELECT COUNT(*) AS count FROM sessions').get().count, 0);
+  assert.equal(database.prepare('SELECT COUNT(*) AS count FROM login_failures').get().count, 0);
   assert.equal(database.prepare("SELECT COUNT(*) AS count FROM sqlite_sequence WHERE name = 'appointment_references'").get().count, 0);
   database.close();
   assert.deepEqual(fs.readdirSync(pdfDirectory), ['keep.txt']);

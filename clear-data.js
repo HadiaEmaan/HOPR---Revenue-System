@@ -38,7 +38,12 @@ function clearClinicData(databasePath, { deleteGeneratedFiles = true } = {}) {
       throw new Error(`Expected exactly one admin account; found ${admins.length}. No data was cleared.`);
     }
 
-    for (const table of dataTables) database.exec(`DELETE FROM "${table}"`);
+    const existingTables = new Set(database.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map(row => row.name));
+    for (const table of dataTables) {
+      if (existingTables.has(table)) database.exec(`DELETE FROM "${table}"`);
+    }
+    if (existingTables.has('sessions')) database.exec('DELETE FROM sessions');
+    if (existingTables.has('login_failures')) database.exec('DELETE FROM login_failures');
     database.prepare("DELETE FROM sqlite_sequence WHERE name = 'appointment_references'").run();
     database.exec('COMMIT');
   } catch (error) {

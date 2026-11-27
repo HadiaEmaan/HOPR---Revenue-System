@@ -22,14 +22,19 @@ test('server enforces sessions, roles, doctor scope and audit masking', async t 
       probe.close(error => error ? reject(error) : resolve(selectedPort));
     });
   });
-  const child = spawn(process.execPath, [path.join(__dirname, 'server.js')], {
-    cwd: __dirname,
-    env: { ...process.env, PORT: String(port), HOST: '0.0.0.0', PMS_DB_PATH: path.join(tempDir, 'clinic.sqlite'), NODE_ENV: 'test' },
-    stdio: ['ignore', 'ignore', 'pipe']
-  });
+  let child;
   let serverError = '';
-  child.stderr.setEncoding('utf8');
-  child.stderr.on('data', chunk => { serverError += chunk; });
+  const startServer = () => {
+    const childProcess = spawn(process.execPath, [path.join(__dirname, 'server.js')], {
+      cwd: __dirname,
+      env: { ...process.env, PORT: String(port), HOST: '0.0.0.0', PMS_DB_PATH: path.join(tempDir, 'clinic.sqlite'), NODE_ENV: 'test' },
+      stdio: ['ignore', 'ignore', 'pipe']
+    });
+    childProcess.stderr.setEncoding('utf8');
+    childProcess.stderr.on('data', chunk => { serverError += chunk; });
+    return childProcess;
+  };
+  child = startServer();
   const baseUrl = `http://127.0.0.1:${port}`;
   t.after(async () => {
     child.kill();
@@ -75,6 +80,9 @@ test('server enforces sessions, roles, doctor scope and audit masking', async t 
   assert.equal((await fetch(`${baseUrl}/server.js`)).status, 404);
   assert.equal((await fetch(`${baseUrl}/api.test.js`)).status, 404);
   assert.equal((await fetch(`${baseUrl}/data/clinic.sqlite`)).status, 404);
+  assert.equal((await fetch(baseUrl)).status, 200);
+  assert.equal((await fetch(`${baseUrl}/styles.css`)).status, 200);
+  assert.equal((await fetch(`${baseUrl}/Patient%20History%20%26%20Assessment%20Form.pdf`)).status, 404);
   const clinicPhoto = await fetch(`${baseUrl}/clinic.jpeg`);
   assert.equal(clinicPhoto.status, 200);
   assert.match(clinicPhoto.headers.get('content-type'), /image\/jpeg/);
@@ -84,10 +92,30 @@ test('server enforces sessions, roles, doctor scope and audit masking', async t 
   const invoiceTemplate = await fetch(`${baseUrl}/invoice.png`);
   assert.equal(invoiceTemplate.status, 200);
   assert.match(invoiceTemplate.headers.get('content-type'), /image\/png/);
+  const gymkhanaLogo = await fetch(`${baseUrl}/gymkhana.png`);
+  assert.equal(gymkhanaLogo.status, 200);
+  assert.match(gymkhanaLogo.headers.get('content-type'), /image\/png/);
   assert.equal((await request('/api/setup-status')).body.setupRequired, true);
   const setup = await request('/api/setup', { method: 'POST', body: JSON.stringify({ name: 'Clinic Admin', email: 'admin@example.test', password }) });
   assert.equal(setup.response.status, 201, JSON.stringify(setup.body));
   let adminCookie = setup.cookie;
+  const firstProcess = child;
+  const firstProcessExit = new Promise(resolve => firstProcess.once('exit', resolve));
+  firstProcess.kill();
+  await firstProcessExit;
+  child = startServer();
+  ready = false;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (child.exitCode !== null) break;
+    try {
+      await fetch(`${baseUrl}/api/session`);
+      ready = true;
+      break;
+    } catch { await new Promise(resolve => setTimeout(resolve, 50)); }
+  }
+  assert.equal(ready, true, `server did not restart: ${serverError}`);
+  const persistedSession = await request('/api/session', { cookie: adminCookie });
+  assert.equal(persistedSession.body.user.email, 'admin@example.test', 'a signed-in session should survive a server process restart');
   const secondaryAdminCookie = await login('admin@example.test', password);
   const incorrectCurrentPassword = await request('/api/change-password', {
     method: 'POST', cookie: adminCookie,
@@ -206,7 +234,7 @@ test('server enforces sessions, roles, doctor scope and audit masking', async t 
   assert.equal(savedAssessment.response.status, 200, JSON.stringify(savedAssessment.body));
   assert.equal(savedAssessment.body.status, 'Draft');
   assert.equal(savedAssessment.body.answers.presentingComplaint, 'Lower back pain');
-  assert.equal(fs.existsSync(path.join(tempDir, 'patient-assessments', `assessment-${firstAppointmentNumber}.pdf`)), true);
+  assert.equal(fs.existsSync(path.join(tempDir, 'patient-assessments', `assessment-${firstAppointmentNumber}.pdf`)), false);
   const assessmentPdf = await fetch(`${baseUrl}${savedAssessment.body.pdfUrl}`, { headers: { Cookie: doctorA.cookie } });
   assert.equal(assessmentPdf.status, 200);
   assert.match(assessmentPdf.headers.get('content-type'), /application\/pdf/);
@@ -842,7 +870,7 @@ test('server enforces sessions, roles, doctor scope and audit masking', async t 
   assert.equal(selectedInvoice.response.status, 200);
   const deletedAssessmentDirectory = path.join(tempDir, 'patient-assessments');
   const deletedAssessmentPdfPath = path.join(deletedAssessmentDirectory, `assessment-${selectedAppointment.body.appointmentNumber}.pdf`);
-  assert.equal(fs.existsSync(deletedAssessmentPdfPath), true, 'the selected assessment PDF should exist before deletion');
+  assert.equal(fs.existsSync(deletedAssessmentPdfPath), false, 'assessment PDFs should be generated in memory, not persisted to disk');
   const patientRowsBeforeDelete = await request('/api/workspace?view=Patients', { cookie: adminCookie });
   const patientRowBeforeDelete = patientRowsBeforeDelete.body.rows.find(row => row.id === retainedAppointment.body.patientId);
   assert.equal(patientRowBeforeDelete.appointmentNumber, selectedAppointment.body.appointmentNumber);
@@ -856,6 +884,7 @@ test('server enforces sessions, roles, doctor scope and audit masking', async t 
   assert.equal(deletedSelectedAppointment.response.status, 200, JSON.stringify(deletedSelectedAppointment.body));
   assert.equal(deletedSelectedAppointment.body.patientRemoved, false);
   assert.equal(fs.existsSync(deletedAssessmentPdfPath), false, 'the deleted visit assessment PDF should be removed');
+  assert.equal((await request(`/api/appointments/${selectedAppointment.body.appointmentId}/assessment.pdf`, { cookie: adminCookie })).response.status, 404);
   const retainedPatientHistory = await request(`/api/patients/${retainedAppointment.body.patientId}/full-record`, { cookie: adminCookie });
   assert.equal(retainedPatientHistory.body.visits.length, 1, 'other appointments for the patient should remain');
   assert.equal(retainedPatientHistory.body.visits[0].id, retainedAppointment.body.appointmentId);
@@ -946,7 +975,7 @@ test('server enforces sessions, roles, doctor scope and audit masking', async t 
     method: 'DELETE', cookie: manager.cookie
   })).response.status, 403, 'clinic managers must not delete full patient records');
   const patientRecordAssessmentPdf = path.join(deletedAssessmentDirectory, `assessment-${patientRecordFirstVisit.body.appointmentNumber}.pdf`);
-  assert.equal(fs.existsSync(patientRecordAssessmentPdf), true);
+  assert.equal(fs.existsSync(patientRecordAssessmentPdf), false);
   const deletedPatientRecord = await request(`/api/patients/by-appointment/${patientRecordSecondVisit.body.appointmentNumber}`, {
     method: 'DELETE', cookie: adminCookie
   });
@@ -957,6 +986,7 @@ test('server enforces sessions, roles, doctor scope and audit masking', async t 
     patientRecordSecondVisit.body.appointmentNumber
   ]);
   assert.equal(fs.existsSync(patientRecordAssessmentPdf), false, 'all assessment PDFs for the selected patient record should be removed');
+  assert.equal((await request(`/api/appointments/${patientRecordFirstVisit.body.appointmentId}/assessment.pdf`, { cookie: adminCookie })).response.status, 404);
   const patientRecordsAfterFullDelete = await request('/api/workspace?view=Patients', { cookie: adminCookie });
   assert.equal(patientRecordsAfterFullDelete.body.rows.some(row => row.id === patientRecordFirstVisit.body.patientId), false);
   assert.ok(patientRecordsAfterFullDelete.body.rows.some(row => row.id === separatelyRegisteredPatient.body.patientId), 'a separately registered duplicate patient record should remain');

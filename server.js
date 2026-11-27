@@ -4,22 +4,27 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { DatabaseSync } = require('node:sqlite');
+const { AsyncLocalStorage } = require('node:async_hooks');
+const { pathToFileURL } = require('node:url');
+const { createClient } = require('@libsql/client');
 const { PDFDocument, StandardFonts, rgb } = require('pdf-lib');
 
 const root = __dirname;
 const dataDir = path.join(root, 'data');
 const dbPath = process.env.PMS_DB_PATH || path.join(dataDir, 'clinic.sqlite');
-const assessmentPdfDir = path.join(path.dirname(dbPath), 'patient-assessments');
 const assessmentTemplatePath = path.join(root, 'Patient History & Assessment Form.pdf');
-const port = Number(process.env.PORT || 4177);
-const host = process.env.HOST || '127.0.0.1';
+const port = Number(process.env.PORT || 7860);
+const host = process.env.HOST || '0.0.0.0';
+const databaseUrl = process.env.TURSO_DATABASE_URL || pathToFileURL(dbPath).href;
+const dbClient = createClient({
+  url: databaseUrl,
+  authToken: process.env.TURSO_AUTH_TOKEN
+});
+const requestContext = new AsyncLocalStorage();
 const sessionHours = 12;
 const cookieName = 'hopr_session';
 const roles = new Set(['admin', 'manager', 'doctor', 'gymkhana']);
 const labels = { admin: 'Head / Admin', manager: 'Clinic Manager', doctor: 'Physiotherapist', gymkhana: 'Gymkhana Audit' };
-const sessions = new Map();
-const loginFailures = new Map();
 const mimeTypes = { '.css': 'text/css; charset=utf-8', '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.json': 'application/json; charset=utf-8', '.svg': 'image/svg+xml', '.ico': 'image/x-icon', '.jpeg': 'image/jpeg', '.png': 'image/png' };
 const assessmentFields = [
   ['patientName', 'Patient name'], ['age', 'Age'], ['gender', 'Gender'], ['contactNumber', 'Contact no.'],
@@ -34,12 +39,88 @@ const assessmentFields = [
 ];
 const assessmentFieldNames = new Set(assessmentFields.map(([key]) => key));
 
-fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-const db = new DatabaseSync(dbPath);
-db.exec(`
-  PRAGMA foreign_keys = ON;
-  PRAGMA journal_mode = WAL;
-  PRAGMA busy_timeout = 5000;
+function activeConnection() {
+  return requestContext.getStore()?.transaction || dbClient;
+}
+
+const db = {
+  prepare(sql) {
+    const normalizeArgs = args => args.map(value => value === undefined ? null : value);
+    return {
+      async all(...args) {
+        const result = await activeConnection().execute({ sql, args: normalizeArgs(args) });
+        return result.rows.map(row => Object.fromEntries(result.columns.map((column, index) => [
+          typeof column === 'string' ? column : column.name,
+          row[index]
+        ])));
+      },
+      async get(...args) {
+        const result = await activeConnection().execute({ sql, args: normalizeArgs(args) });
+        return result.rows.length
+          ? Object.fromEntries(result.columns.map((column, index) => [
+            typeof column === 'string' ? column : column.name,
+            result.rows[0][index]
+          ]))
+          : undefined;
+      },
+      async run(...args) {
+        const result = await activeConnection().execute({ sql, args: normalizeArgs(args) });
+        return {
+          changes: Number(result.rowsAffected),
+          lastInsertRowid: result.lastInsertRowid === undefined ? undefined : Number(result.lastInsertRowid)
+        };
+      }
+    };
+  },
+  async exec(sql) {
+    const statement = sql.trim();
+    const context = requestContext.getStore();
+    if (/^BEGIN(?:\s+IMMEDIATE)?$/i.test(statement)) {
+      if (!context || context.transaction) throw new Error('Database transaction context is unavailable.');
+      context.transaction = await dbClient.transaction('write');
+      return;
+    }
+    if (/^COMMIT$/i.test(statement)) {
+      if (!context?.transaction) throw new Error('No database transaction is active.');
+      const transaction = context.transaction;
+      await transaction.commit();
+      context.transaction = null;
+      return;
+    }
+    if (/^ROLLBACK$/i.test(statement)) {
+      if (!context?.transaction) return;
+      const transaction = context.transaction;
+      await transaction.rollback();
+      context.transaction = null;
+      return;
+    }
+
+    const statements = statement.split(';').map(part => part.trim()).filter(Boolean);
+    if (!statements.length) return;
+    const connection = activeConnection();
+    if (statements.length === 1) {
+      await connection.execute(statements[0]);
+    } else if (connection === dbClient) {
+      await dbClient.batch(statements, 'write');
+    } else {
+      for (const sqlStatement of statements) await connection.execute(sqlStatement);
+    }
+  },
+  get isTransaction() {
+    return Boolean(requestContext.getStore()?.transaction);
+  },
+  async close() {
+    await dbClient.close();
+  }
+};
+
+async function initializeSchema() {
+if (process.env.VERCEL && (!process.env.TURSO_DATABASE_URL || !process.env.TURSO_AUTH_TOKEN)) {
+  throw new Error('Set TURSO_DATABASE_URL and TURSO_AUTH_TOKEN in the Vercel project settings.');
+}
+if (!process.env.TURSO_DATABASE_URL && !process.env.VERCEL) fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+await dbClient.execute('PRAGMA foreign_keys = ON');
+await db.exec(`
   CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
     email TEXT NOT NULL UNIQUE COLLATE NOCASE,
@@ -70,6 +151,7 @@ db.exec(`
     appointment_date TEXT NOT NULL,
     appointment_time TEXT NOT NULL,
     visit_type TEXT NOT NULL CHECK (visit_type IN ('New patient','Follow-up')),
+    visit_category TEXT NOT NULL DEFAULT '',
     session_number INTEGER NOT NULL DEFAULT 1 CHECK (session_number > 0),
     status TEXT NOT NULL DEFAULT 'Confirmed' CHECK (status IN ('Confirmed','Waiting','In session','Completed','Cancelled')),
     created_by TEXT NOT NULL REFERENCES users(id),
@@ -87,7 +169,8 @@ db.exec(`
     amount_paisa INTEGER NOT NULL CHECK (amount_paisa >= 0),
     amount_manager_updated INTEGER NOT NULL DEFAULT 0 CHECK (amount_manager_updated IN (0,1)),
     club_share_paisa INTEGER NOT NULL DEFAULT 0 CHECK (club_share_paisa >= 0),
-    payment_mode TEXT NOT NULL CHECK (payment_mode IN ('Cash','Online','Unpaid')),
+    payment_mode TEXT NOT NULL CHECK (payment_mode IN ('Cash','Online','POS','Unpaid')),
+    payment_status TEXT NOT NULL DEFAULT 'Paid' CHECK (payment_status IN ('Paid','Unpaid')),
     recorded_by TEXT NOT NULL REFERENCES users(id),
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
@@ -168,70 +251,82 @@ db.exec(`
     updated_by TEXT NOT NULL REFERENCES users(id),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
+  CREATE TABLE IF NOT EXISTS sessions (
+    token_hash TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    expires_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions(user_id);
+  CREATE INDEX IF NOT EXISTS sessions_expiry_idx ON sessions(expires_at);
+  CREATE TABLE IF NOT EXISTS login_failures (
+    address_hash TEXT PRIMARY KEY,
+    failure_count INTEGER NOT NULL DEFAULT 0,
+    window_expires_at INTEGER NOT NULL
+  );
 `);
 
-db.exec("UPDATE users SET role = 'manager' WHERE role = 'reception'");
+await db.exec("UPDATE users SET role = 'manager' WHERE role = 'reception'");
 
-const auditColumns = db.prepare('PRAGMA table_info(audit_log)').all();
+const auditColumns = await db.prepare('PRAGMA table_info(audit_log)').all();
 if (!auditColumns.some(column => column.name === 'details_json')) {
-  db.exec('ALTER TABLE audit_log ADD COLUMN details_json TEXT');
+  await db.exec('ALTER TABLE audit_log ADD COLUMN details_json TEXT');
 }
 
-const invoiceColumns = db.prepare('PRAGMA table_info(invoices)').all();
+const invoiceColumns = await db.prepare('PRAGMA table_info(invoices)').all();
 if (!invoiceColumns.some(column => column.name === 'printed_invoice_json')) {
-  db.exec('ALTER TABLE invoices ADD COLUMN printed_invoice_json TEXT');
+  await db.exec('ALTER TABLE invoices ADD COLUMN printed_invoice_json TEXT');
 }
 if (!invoiceColumns.some(column => column.name === 'printed_at')) {
-  db.exec('ALTER TABLE invoices ADD COLUMN printed_at TEXT');
+  await db.exec('ALTER TABLE invoices ADD COLUMN printed_at TEXT');
 }
 if (!invoiceColumns.some(column => column.name === 'printed_by')) {
-  db.exec('ALTER TABLE invoices ADD COLUMN printed_by TEXT REFERENCES users(id)');
+  await db.exec('ALTER TABLE invoices ADD COLUMN printed_by TEXT REFERENCES users(id)');
 }
 
-const patientColumns = db.prepare('PRAGMA table_info(patients)').all();
+const patientColumns = await db.prepare('PRAGMA table_info(patients)').all();
 if (!patientColumns.some(column => column.name === 'membership_id')) {
-  db.exec("ALTER TABLE patients ADD COLUMN membership_id TEXT NOT NULL DEFAULT '' COLLATE NOCASE");
+  await db.exec("ALTER TABLE patients ADD COLUMN membership_id TEXT NOT NULL DEFAULT '' COLLATE NOCASE");
 }
 if (!patientColumns.some(column => column.name === 'membership_source')) {
-  db.exec("ALTER TABLE patients ADD COLUMN membership_source TEXT NOT NULL DEFAULT 'gymkhana' CHECK (membership_source IN ('gymkhana','admin'))");
+  await db.exec("ALTER TABLE patients ADD COLUMN membership_source TEXT NOT NULL DEFAULT 'gymkhana' CHECK (membership_source IN ('gymkhana','admin'))");
 }
 if (!patientColumns.some(column => column.name === 'sessions_prescribed')) {
-  db.exec('ALTER TABLE patients ADD COLUMN sessions_prescribed INTEGER CHECK (sessions_prescribed IS NULL OR sessions_prescribed BETWEEN 1 AND 100)');
+  await db.exec('ALTER TABLE patients ADD COLUMN sessions_prescribed INTEGER CHECK (sessions_prescribed IS NULL OR sessions_prescribed BETWEEN 1 AND 100)');
 }
 if (!patientColumns.some(column => column.name === 'sessions_reception_updated')) {
-  db.exec('ALTER TABLE patients ADD COLUMN sessions_reception_updated INTEGER NOT NULL DEFAULT 0 CHECK (sessions_reception_updated IN (0,1))');
+  await db.exec('ALTER TABLE patients ADD COLUMN sessions_reception_updated INTEGER NOT NULL DEFAULT 0 CHECK (sessions_reception_updated IN (0,1))');
 }
-const appointmentColumns = db.prepare('PRAGMA table_info(appointments)').all();
+const appointmentColumns = await db.prepare('PRAGMA table_info(appointments)').all();
 if (!appointmentColumns.some(column => column.name === 'visit_category')) {
-  db.exec("ALTER TABLE appointments ADD COLUMN visit_category TEXT NOT NULL DEFAULT ''");
+  await db.exec("ALTER TABLE appointments ADD COLUMN visit_category TEXT NOT NULL DEFAULT ''");
 }
 if (!appointmentColumns.some(column => column.name === 'session_number')) {
-  db.exec('ALTER TABLE appointments ADD COLUMN session_number INTEGER NOT NULL DEFAULT 1 CHECK (session_number > 0)');
-  db.exec(`WITH numbered AS (
+  await db.exec('ALTER TABLE appointments ADD COLUMN session_number INTEGER NOT NULL DEFAULT 1 CHECK (session_number > 0)');
+  await db.exec(`WITH numbered AS (
     SELECT id, ROW_NUMBER() OVER (PARTITION BY patient_id ORDER BY appointment_date, appointment_time, created_at, id) AS session_number
     FROM appointments WHERE status != 'Cancelled'
   )
   UPDATE appointments SET session_number = (SELECT session_number FROM numbered WHERE numbered.id = appointments.id)
   WHERE id IN (SELECT id FROM numbered)`);
 }
-db.exec('DROP INDEX IF EXISTS patients_membership_id_unique');
-db.exec("CREATE UNIQUE INDEX IF NOT EXISTS patients_gymkhana_membership_id_unique ON patients(membership_id COLLATE NOCASE) WHERE membership_id != '' AND membership_source = 'gymkhana'");
-const paymentColumns = db.prepare('PRAGMA table_info(payments)').all();
+await db.exec('DROP INDEX IF EXISTS patients_membership_id_unique');
+await db.exec("CREATE UNIQUE INDEX IF NOT EXISTS patients_gymkhana_membership_id_unique ON patients(membership_id COLLATE NOCASE) WHERE membership_id != '' AND membership_source = 'gymkhana'");
+const paymentColumns = await db.prepare('PRAGMA table_info(payments)').all();
 if (!paymentColumns.some(column => column.name === 'payment_status')) {
-  db.exec("ALTER TABLE payments ADD COLUMN payment_status TEXT NOT NULL DEFAULT 'Paid' CHECK (payment_status IN ('Paid','Unpaid'))");
-  db.exec("UPDATE payments SET payment_status = 'Unpaid' WHERE payment_mode = 'Unpaid'");
+  await db.exec("ALTER TABLE payments ADD COLUMN payment_status TEXT NOT NULL DEFAULT 'Paid' CHECK (payment_status IN ('Paid','Unpaid'))");
+  await db.exec("UPDATE payments SET payment_status = 'Unpaid' WHERE payment_mode = 'Unpaid'");
 }
 if (!paymentColumns.some(column => column.name === 'club_share_paisa')) {
-  db.exec('ALTER TABLE payments ADD COLUMN club_share_paisa INTEGER NOT NULL DEFAULT 0 CHECK (club_share_paisa >= 0)');
+  await db.exec('ALTER TABLE payments ADD COLUMN club_share_paisa INTEGER NOT NULL DEFAULT 0 CHECK (club_share_paisa >= 0)');
 }
 if (!paymentColumns.some(column => column.name === 'amount_manager_updated')) {
-  db.exec('ALTER TABLE payments ADD COLUMN amount_manager_updated INTEGER NOT NULL DEFAULT 0 CHECK (amount_manager_updated IN (0,1))');
+  await db.exec('ALTER TABLE payments ADD COLUMN amount_manager_updated INTEGER NOT NULL DEFAULT 0 CHECK (amount_manager_updated IN (0,1))');
 }
-const paymentTableDefinition = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'payments'").get().sql;
+const paymentTableDefinition = (await db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'payments'").get()).sql;
 if (!paymentTableDefinition.includes("'POS'")) {
-  db.exec('BEGIN IMMEDIATE');
+  await db.exec('BEGIN IMMEDIATE');
   try {
-    db.exec(`CREATE TABLE payments_with_pos (
+    await db.exec(`CREATE TABLE payments_with_pos (
       id TEXT PRIMARY KEY,
       appointment_id TEXT NOT NULL REFERENCES appointments(id),
       amount_paisa INTEGER NOT NULL CHECK (amount_paisa >= 0),
@@ -247,77 +342,70 @@ if (!paymentTableDefinition.includes("'POS'")) {
     DROP TABLE payments;
     ALTER TABLE payments_with_pos RENAME TO payments;
   `);
-    db.exec('COMMIT');
+    await db.exec('COMMIT');
   } catch (error) {
-    if (db.isTransaction) db.exec('ROLLBACK');
+    if (db.isTransaction) await db.exec('ROLLBACK');
     throw error;
   }
 }
-db.prepare('INSERT OR IGNORE INTO appointment_references (appointment_id) SELECT id FROM appointments ORDER BY created_at, id').run();
+await db.prepare('INSERT OR IGNORE INTO appointment_references (appointment_id) SELECT id FROM appointments ORDER BY created_at, id').run();
+}
+
+const dbReady = requestContext.run({ transaction: null }, async () => {
+  await initializeSchema();
+  await bootstrapAdmin();
+});
 
 function makeId(prefix) { return `${prefix}_${crypto.randomUUID()}`; }
 function passwordDigest(password, salt) { return crypto.pbkdf2Sync(password, salt, 310000, 32, 'sha256').toString('hex'); }
-function audit(actorId, action, entityType, entityId, details = null) {
-  db.prepare('INSERT INTO audit_log (id, actor_id, action, entity_type, entity_id, details_json) VALUES (?, ?, ?, ?, ?, ?)')
+async function audit(actorId, action, entityType, entityId, details = null) {
+  await db.prepare('INSERT INTO audit_log (id, actor_id, action, entity_type, entity_id, details_json) VALUES (?, ?, ?, ?, ?, ?)')
     .run(makeId('evt'), actorId || null, action, entityType, entityId || null, details === null ? null : JSON.stringify(details));
 }
 
-function deleteAppointmentRecords(appointments) {
-  const assessmentPdfPaths = [];
+async function deleteAppointmentRecords(appointments) {
   for (const appointment of appointments) {
-    db.prepare('DELETE FROM clinical_notes WHERE appointment_id = ?').run(appointment.id);
-    db.prepare('DELETE FROM invoices WHERE appointment_id = ?').run(appointment.id);
-    db.prepare('DELETE FROM patient_assessments WHERE appointment_id = ?').run(appointment.id);
-    db.prepare('DELETE FROM payments WHERE appointment_id = ?').run(appointment.id);
-    db.prepare('DELETE FROM appointment_references WHERE appointment_id = ?').run(appointment.id);
-    db.prepare('DELETE FROM appointments WHERE id = ?').run(appointment.id);
-    assessmentPdfPaths.push(path.join(assessmentPdfDir, `assessment-${appointment.appointmentNumber}.pdf`));
-  }
-  return assessmentPdfPaths;
-}
-
-function removeGeneratedAssessmentPdfs(pdfPaths) {
-  for (const pdfPath of pdfPaths) {
-    if (fs.existsSync(pdfPath)) fs.unlinkSync(pdfPath);
+    await db.prepare('DELETE FROM clinical_notes WHERE appointment_id = ?').run(appointment.id);
+    await db.prepare('DELETE FROM invoices WHERE appointment_id = ?').run(appointment.id);
+    await db.prepare('DELETE FROM patient_assessments WHERE appointment_id = ?').run(appointment.id);
+    await db.prepare('DELETE FROM payments WHERE appointment_id = ?').run(appointment.id);
+    await db.prepare('DELETE FROM appointment_references WHERE appointment_id = ?').run(appointment.id);
+    await db.prepare('DELETE FROM appointments WHERE id = ?').run(appointment.id);
   }
 }
 
-function getFormerStaffId() {
+async function getFormerStaffId() {
   const email = 'former-staff@invalid.local';
-  const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
+  const existing = await db.prepare('SELECT id FROM users WHERE email = ?').get(email);
   if (existing) return existing.id;
   const id = makeId('usr');
   const salt = crypto.randomBytes(16).toString('hex');
   const randomPassword = crypto.randomBytes(48).toString('base64url');
-  db.prepare('INSERT INTO users (id, email, name, role, password_hash, password_salt, active) VALUES (?, ?, ?, ?, ?, ?, 0)')
+  await db.prepare('INSERT INTO users (id, email, name, role, password_hash, password_salt, active) VALUES (?, ?, ?, ?, ?, ?, 0)')
     .run(id, email, 'Former staff', 'manager', passwordDigest(randomPassword, salt), salt);
   return id;
 }
 
-function revokeUserSessions(userId) {
-  for (const [digest, session] of sessions) {
-    if (session.userId === userId) sessions.delete(digest);
-  }
+async function revokeUserSessions(userId) {
+  await db.prepare('DELETE FROM sessions WHERE user_id = ?').run(userId);
 }
 
-function bootstrapAdmin() {
+async function bootstrapAdmin() {
   const email = process.env.PMS_ADMIN_EMAIL?.trim().toLowerCase();
   const password = process.env.PMS_ADMIN_PASSWORD;
   if (!email && !password) return;
   if (!email || !password || password.length < 14) {
     throw new Error('Set both PMS_ADMIN_EMAIL and PMS_ADMIN_PASSWORD (at least 14 characters).');
   }
-  const existing = db.prepare('SELECT id FROM users WHERE role = ? LIMIT 1').get('admin');
+  const existing = await db.prepare('SELECT id FROM users WHERE role = ? LIMIT 1').get('admin');
   if (existing) return;
   const id = makeId('usr');
   const salt = crypto.randomBytes(16).toString('hex');
-  db.prepare('INSERT INTO users (id, email, name, role, password_hash, password_salt) VALUES (?, ?, ?, ?, ?, ?)')
+  await db.prepare('INSERT INTO users (id, email, name, role, password_hash, password_salt) VALUES (?, ?, ?, ?, ?, ?)')
     .run(id, email, email.split('@')[0], 'admin', passwordDigest(password, salt), salt);
-  audit(id, 'bootstrap', 'user', id);
+  await audit(id, 'bootstrap', 'user', id);
   console.log(`Initial admin account created for ${email}.`);
 }
-
-bootstrapAdmin();
 
 function sendJson(response, status, data, headers = {}) {
   response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', ...headers });
@@ -328,17 +416,17 @@ function parseCookies(header = '') {
   return Object.fromEntries(header.split(';').map(part => part.trim().split(/=(.*)/s).slice(0, 2)).filter(pair => pair.length === 2));
 }
 
-function getUser(request) {
+async function getUser(request) {
   const token = parseCookies(request.headers.cookie)[cookieName];
   if (!token) return null;
   const digest = crypto.createHash('sha256').update(token).digest('hex');
-  const session = sessions.get(digest);
+  const session = await db.prepare('SELECT user_id AS userId, expires_at AS expiresAt FROM sessions WHERE token_hash = ?').get(digest);
   if (!session || session.expiresAt <= Date.now()) {
-    sessions.delete(digest);
+    if (session) await db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(digest);
     return null;
   }
-  const user = db.prepare('SELECT id, email, name, role FROM users WHERE id = ? AND active = 1').get(session.userId);
-  if (!user) sessions.delete(digest);
+  const user = await db.prepare('SELECT id, email, name, role FROM users WHERE id = ? AND active = 1').get(session.userId);
+  if (!user) await db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(digest);
   return user || null;
 }
 
@@ -478,6 +566,19 @@ async function generateAssessmentPdf(appointmentNumber, answers) {
 }
 
 function jsonBody(request, maxBytes = 12000) {
+  if (request.body !== undefined) {
+    const body = request.body;
+    const serialized = Buffer.isBuffer(body) ? body.toString('utf8') : typeof body === 'string' ? body : null;
+    if (serialized !== null) {
+      if (Buffer.byteLength(serialized) > maxBytes) return Promise.reject(Object.assign(new Error('Request body too large'), { status: 413 }));
+      try { return Promise.resolve(JSON.parse(serialized || '{}')); }
+      catch { return Promise.reject(Object.assign(new Error('Invalid JSON body'), { status: 400 })); }
+    }
+    if (body && typeof body === 'object') {
+      if (Buffer.byteLength(JSON.stringify(body)) > maxBytes) return Promise.reject(Object.assign(new Error('Request body too large'), { status: 413 }));
+      return Promise.resolve(body);
+    }
+  }
   return new Promise((resolve, reject) => {
     let body = '';
     request.on('data', chunk => {
@@ -498,17 +599,30 @@ function jsonBody(request, maxBytes = 12000) {
 function assertSameOrigin(request) {
   const origin = request.headers.origin;
   if (!origin) return;
-  const expected = process.env.PMS_PUBLIC_ORIGIN || `${request.socket.encrypted ? 'https' : 'http'}://${request.headers.host}`;
+  const forwardedProtocol = request.headers['x-forwarded-proto']?.split(',')[0];
+  const expected = process.env.PMS_PUBLIC_ORIGIN || `${forwardedProtocol || (request.socket?.encrypted ? 'https' : 'http')}://${request.headers.host}`;
   if (origin !== expected) throw Object.assign(new Error('Cross-origin request rejected'), { status: 403 });
 }
 
-function limitLogin(request) {
-  const key = request.socket.remoteAddress || 'unknown';
+async function limitLogin(request) {
+  const forwardedFor = request.headers['x-forwarded-for']?.split(',')[0].trim();
+  const address = forwardedFor || request.socket?.remoteAddress || 'unknown';
+  const key = crypto.createHash('sha256').update(address).digest('hex');
   const now = Date.now();
-  const entry = loginFailures.get(key) || { count: 0, until: now + 15 * 60 * 1000 };
-  if (entry.until < now) { entry.count = 0; entry.until = now + 15 * 60 * 1000; }
-  if (entry.count >= 10) throw Object.assign(new Error('Too many attempts. Try again in 15 minutes.'), { status: 429 });
-  return { key, entry };
+  const windowExpiresAt = now + 15 * 60 * 1000;
+  const entry = await db.prepare('SELECT failure_count AS failureCount, window_expires_at AS windowExpiresAt FROM login_failures WHERE address_hash = ?').get(key);
+  if (!entry || entry.windowExpiresAt <= now) {
+    await db.prepare(`INSERT INTO login_failures (address_hash, failure_count, window_expires_at) VALUES (?, 0, ?)
+      ON CONFLICT(address_hash) DO UPDATE SET failure_count = 0, window_expires_at = excluded.window_expires_at`)
+      .run(key, windowExpiresAt);
+    return key;
+  }
+  if (entry.failureCount >= 10) throw Object.assign(new Error('Too many attempts. Try again in 15 minutes.'), { status: 429 });
+  return key;
+}
+
+async function recordLoginFailure(addressHash) {
+  await db.prepare('UPDATE login_failures SET failure_count = failure_count + 1 WHERE address_hash = ?').run(addressHash);
 }
 
 function todayString() { return new Intl.DateTimeFormat('en-CA', { timeZone: process.env.PMS_TIME_ZONE || 'Asia/Karachi' }).format(new Date()); }
@@ -532,19 +646,19 @@ function weekRange(value) {
   return { startDate, endDate: shiftIsoDate(startDate, 6) };
 }
 
-function dashboard(user, selectedDate, mode) {
+async function dashboard(user, selectedDate, mode) {
   const today = todayString();
   const range = mode === 'week' ? weekRange(selectedDate) : { startDate: selectedDate, endDate: selectedDate };
   const schedule = { mode, selectedDate, ...range };
   if (user.role === 'gymkhana') {
-    const visits = db.prepare("SELECT COUNT(*) AS count FROM appointments WHERE appointment_date BETWEEN ? AND ? AND status != 'Cancelled'").get(range.startDate, range.endDate).count;
+    const visits = (await db.prepare("SELECT COUNT(*) AS count FROM appointments WHERE appointment_date BETWEEN ? AND ? AND status != 'Cancelled'").get(range.startDate, range.endDate)).count;
     const month = today.slice(0, 7);
-    const monthly = db.prepare("SELECT COUNT(*) AS count FROM appointments WHERE substr(appointment_date, 1, 7) = ? AND status != 'Cancelled'").get(month).count;
-    const visitRoster = db.prepare(`SELECT p.name, a.appointment_time AS time, a.appointment_date AS date, a.status
+    const monthly = (await db.prepare("SELECT COUNT(*) AS count FROM appointments WHERE substr(appointment_date, 1, 7) = ? AND status != 'Cancelled'").get(month)).count;
+    const visitRoster = await db.prepare(`SELECT p.name, a.appointment_time AS time, a.appointment_date AS date, a.status
       FROM appointments a JOIN patients p ON p.id = a.patient_id
       WHERE a.appointment_date BETWEEN ? AND ? AND a.status != 'Cancelled'
       ORDER BY a.appointment_date, a.appointment_time LIMIT 500`).all(range.startDate, range.endDate);
-    const queue = db.prepare(`SELECT p.name, a.appointment_time AS time, a.status
+    const queue = await db.prepare(`SELECT p.name, a.appointment_time AS time, a.status
       FROM appointments a JOIN patients p ON p.id = a.patient_id
       WHERE a.appointment_date = ? AND a.status IN ('Waiting','In session')
       ORDER BY CASE a.status WHEN 'In session' THEN 0 ELSE 1 END, a.appointment_time LIMIT 20`).all(today);
@@ -554,7 +668,7 @@ function dashboard(user, selectedDate, mode) {
   const whereDoctor = user.role === 'doctor' ? ' AND a.doctor_id = ?' : '';
   const patientCondition = ['admin', 'doctor'].includes(user.role) ? 'p.condition' : "''";
   const params = user.role === 'doctor' ? [range.startDate, range.endDate, user.id] : [range.startDate, range.endDate];
-  const visits = db.prepare(`
+  const visits = await db.prepare(`
     SELECT a.id, ar.appointment_number AS appointmentNumber, a.appointment_date AS date, a.appointment_time AS time, COALESCE(NULLIF(a.visit_category, ''), a.visit_type) AS visit, a.status,
       p.id AS patientId, p.name, ${patientCondition} AS area, d.name AS doctor
     FROM appointments a JOIN appointment_references ar ON ar.appointment_id = a.id JOIN patients p ON p.id = a.patient_id JOIN users d ON d.id = a.doctor_id
@@ -562,22 +676,22 @@ function dashboard(user, selectedDate, mode) {
     ORDER BY a.appointment_date, a.appointment_time LIMIT 500
   `).all(...params);
   const assignedPatients = user.role === 'doctor'
-    ? db.prepare(`SELECT p.id, p.name, p.condition, MAX(a.appointment_date) AS lastVisit
+    ? await db.prepare(`SELECT p.id, p.name, p.condition, MAX(a.appointment_date) AS lastVisit
       FROM appointments a JOIN patients p ON p.id = a.patient_id
       WHERE a.doctor_id = ? AND a.status != 'Cancelled'
       GROUP BY p.id ORDER BY lastVisit DESC, p.name LIMIT 5`).all(user.id)
     : [];
   const waiting = visits.filter(visit => visit.date === today && (visit.status === 'Waiting' || visit.status === 'In session'));
   const revenue = user.role === 'admin'
-    ? db.prepare(`SELECT COALESCE(SUM(p.amount_paisa), 0) AS total FROM payments p JOIN appointments a ON a.id = p.appointment_id WHERE a.appointment_date BETWEEN ? AND ? AND p.payment_status = 'Paid'`).get(range.startDate, range.endDate).total
+    ? (await db.prepare(`SELECT COALESCE(SUM(p.amount_paisa), 0) AS total FROM payments p JOIN appointments a ON a.id = p.appointment_id WHERE a.appointment_date BETWEEN ? AND ? AND p.payment_status = 'Paid'`).get(range.startDate, range.endDate)).total
     : null;
-  const countUsers = user.role === 'admin' ? db.prepare('SELECT COUNT(*) AS count FROM users WHERE active = 1').get().count : null;
+  const countUsers = user.role === 'admin' ? (await db.prepare('SELECT COUNT(*) AS count FROM users WHERE active = 1').get()).count : null;
   const doctors = ['admin', 'manager'].includes(user.role)
-    ? db.prepare("SELECT id, name FROM users WHERE role = 'doctor' AND active = 1 ORDER BY name").all()
+    ? await db.prepare("SELECT id, name FROM users WHERE role = 'doctor' AND active = 1 ORDER BY name").all()
     : [];
-  const monthlyCount = user.role === 'admin' ? db.prepare("SELECT COUNT(*) AS count FROM appointments WHERE substr(appointment_date, 1, 7) = ? AND status != 'Cancelled'").get(today.slice(0, 7)).count : null;
+  const monthlyCount = user.role === 'admin' ? (await db.prepare("SELECT COUNT(*) AS count FROM appointments WHERE substr(appointment_date, 1, 7) = ? AND status != 'Cancelled'").get(today.slice(0, 7))).count : null;
   const queueParams = user.role === 'doctor' ? [today, user.id] : [today];
-  const queue = user.role === 'gymkhana' ? [] : db.prepare(`
+  const queue = user.role === 'gymkhana' ? [] : await db.prepare(`
     SELECT a.id, a.appointment_time AS time, a.status, p.id AS patientId, p.name, d.name AS doctor
     FROM appointments a JOIN patients p ON p.id = a.patient_id JOIN users d ON d.id = a.doctor_id
     WHERE a.appointment_date = ? AND a.status IN ('Waiting','In session')${whereDoctor}
@@ -618,13 +732,13 @@ const workspaceRoles = {
   'Operating hours': ['gymkhana']
 };
 
-function getWorkspace(user, view, requestedMonth = '', requestedDate = '') {
+async function getWorkspace(user, view, requestedMonth = '', requestedDate = '') {
   const today = todayString();
   if (!workspaceRoles[view]?.includes(user.role)) return null;
   const doctorFilter = user.role === 'doctor' ? ' AND a.doctor_id = ?' : '';
   const appointmentParams = user.role === 'doctor' ? [user.id] : [];
   if (view === 'New patients') {
-    const rows = db.prepare(`SELECT a.id, ref.appointment_number AS appointmentNumber, a.appointment_date AS date,
+    const rows = await db.prepare(`SELECT a.id, ref.appointment_number AS appointmentNumber, a.appointment_date AS date,
       a.appointment_time AS time, p.id AS patientId, p.name, p.membership_id AS membershipId, p.condition,
       COALESCE(NULLIF(a.visit_category, ''), a.visit_type) AS visit, a.status, d.name AS doctor,
       COALESCE(pa.status, 'Not started') AS assessmentStatus
@@ -637,7 +751,7 @@ function getWorkspace(user, view, requestedMonth = '', requestedDate = '') {
   }
   if (view === 'Appointments' || view === 'My appointments' || view === 'Live queue') {
     const statusFilter = view === 'Live queue' ? " AND a.status IN ('Waiting','In session','Completed')" : '';
-    const rows = db.prepare(`SELECT a.id, ref.appointment_number AS appointmentNumber, a.appointment_date AS date, a.appointment_time AS time, COALESCE(NULLIF(a.visit_category, ''), a.visit_type) AS visit, a.status,
+    const rows = await db.prepare(`SELECT a.id, ref.appointment_number AS appointmentNumber, a.appointment_date AS date, a.appointment_time AS time, COALESCE(NULLIF(a.visit_category, ''), a.visit_type) AS visit, a.status,
       p.id AS patientId, p.name, ${['admin', 'doctor'].includes(user.role) ? 'p.condition' : "''"} AS condition,
       ${['admin', 'manager'].includes(user.role) ? "COALESCE(NULLIF(p.membership_id, ''), 'Appointment #' || ref.appointment_number)" : user.role === 'doctor' && view === 'My appointments' ? 'p.membership_id' : "''"} AS membershipId,
       ${['admin', 'manager'].includes(user.role) ? 'p.phone' : "''"} AS phone,
@@ -655,11 +769,11 @@ function getWorkspace(user, view, requestedMonth = '', requestedDate = '') {
       LEFT JOIN patient_assessments pa ON pa.appointment_id = a.id
       WHERE a.appointment_date >= ?${doctorFilter}${statusFilter}
       ORDER BY a.appointment_date, a.appointment_time LIMIT 300`).all(today, ...appointmentParams);
-    return { view, rows, doctors: ['admin', 'manager'].includes(user.role) ? db.prepare("SELECT id, name FROM users WHERE role = 'doctor' AND active = 1 ORDER BY name").all() : [] };
+    return { view, rows, doctors: ['admin', 'manager'].includes(user.role) ? await db.prepare("SELECT id, name FROM users WHERE role = 'doctor' AND active = 1 ORDER BY name").all() : [] };
   }
   if (view === 'Patients' || view === 'My patients') {
     const patientRoleFilter = user.role === 'doctor' ? `WHERE EXISTS (SELECT 1 FROM appointments a WHERE a.patient_id = p.id AND a.doctor_id = ?)` : '';
-    const rows = db.prepare(`SELECT p.id, p.name, p.age, ${['admin', 'manager', 'doctor'].includes(user.role) ? 'p.condition' : "''"} AS condition,
+    const rows = await db.prepare(`SELECT p.id, p.name, p.age, ${['admin', 'manager', 'doctor'].includes(user.role) ? 'p.condition' : "''"} AS condition,
       ${['admin', 'manager', 'doctor'].includes(user.role) ? 'p.membership_id' : "''"} AS membershipId,
       ${['admin', 'manager'].includes(user.role) ? 'p.phone' : "''"} AS phone,
       ${['admin', 'manager'].includes(user.role) ? 'p.sessions_prescribed' : 'NULL'} AS sessionsPrescribed,
@@ -678,7 +792,7 @@ function getWorkspace(user, view, requestedMonth = '', requestedDate = '') {
     return { view, rows };
   }
   if (view === 'Membership requests') {
-    const rows = db.prepare(`SELECT p.id, p.name, p.phone, p.age,
+    const rows = await db.prepare(`SELECT p.id, p.name, p.phone, p.age,
       (SELECT ar.appointment_number FROM appointments a JOIN appointment_references ar ON ar.appointment_id = a.id
         WHERE a.patient_id = p.id ORDER BY a.appointment_date DESC, a.appointment_time DESC LIMIT 1) AS appointmentNumber,
       (SELECT MAX(a.appointment_date) FROM appointments a WHERE a.patient_id = p.id) AS lastVisit,
@@ -688,34 +802,34 @@ function getWorkspace(user, view, requestedMonth = '', requestedDate = '') {
     return { view, rows };
   }
   if (view === 'Staff & shifts') {
-    return { view, rows: db.prepare("SELECT id, name, email, role, active, created_at AS joined FROM users WHERE email != 'former-staff@invalid.local' ORDER BY role, name").all() };
+    return { view, rows: await db.prepare("SELECT id, name, email, role, active, created_at AS joined FROM users WHERE email != 'former-staff@invalid.local' ORDER BY role, name").all() };
   }
   if (view === 'Inventory') {
-    return { view, rows: db.prepare('SELECT id, name, category, quantity, unit, reorder_at AS reorderAt FROM inventory_items ORDER BY category, name').all() };
+    return { view, rows: await db.prepare('SELECT id, name, category, quantity, unit, reorder_at AS reorderAt FROM inventory_items ORDER BY category, name').all() };
   }
   if (view === 'Billing & expenses' || view === 'Receipts') {
     const canViewExpenses = user.role === 'admin';
-    const receipts = db.prepare(`SELECT pay.id, pay.appointment_id AS appointmentId, pay.amount_paisa AS amountPaisa,
+    const receipts = await db.prepare(`SELECT pay.id, pay.appointment_id AS appointmentId, pay.amount_paisa AS amountPaisa,
       ${['admin', 'manager'].includes(user.role) ? 'pay.amount_manager_updated' : 'NULL'} AS amountManagerUpdated,
       pay.club_share_paisa AS clubSharePaisa, pay.payment_mode AS paymentMode, pay.payment_status AS paymentStatus, pay.created_at AS createdAt,
       p.name AS patient, a.appointment_date AS date, a.appointment_time AS time
       FROM payments pay JOIN appointments a ON a.id = pay.appointment_id JOIN patients p ON p.id = a.patient_id
       ORDER BY pay.created_at DESC LIMIT 200`).all();
-    const expenses = canViewExpenses ? db.prepare('SELECT id, category, description, amount_paisa AS amountPaisa, spent_on AS date FROM expenses ORDER BY spent_on DESC LIMIT 200').all() : [];
-    const revenue = db.prepare("SELECT COALESCE(SUM(amount_paisa), 0) AS total FROM payments WHERE payment_status = 'Paid'").get().total;
+    const expenses = canViewExpenses ? await db.prepare('SELECT id, category, description, amount_paisa AS amountPaisa, spent_on AS date FROM expenses ORDER BY spent_on DESC LIMIT 200').all() : [];
+    const revenue = (await db.prepare("SELECT COALESCE(SUM(amount_paisa), 0) AS total FROM payments WHERE payment_status = 'Paid'").get()).total;
     if (!canViewExpenses) return { view, rows: receipts, expenses, summary: { revenuePaisa: revenue } };
-    const expenseTotal = db.prepare('SELECT COALESCE(SUM(amount_paisa), 0) AS total FROM expenses').get().total;
+    const expenseTotal = (await db.prepare('SELECT COALESCE(SUM(amount_paisa), 0) AS total FROM expenses').get()).total;
     return { view, rows: receipts, expenses, summary: { revenuePaisa: revenue, expensesPaisa: expenseTotal, netPaisa: revenue - expenseTotal } };
   }
   if (view === 'Daily tasks' || view === 'Follow-ups') {
     const doctorOnly = user.role === 'doctor';
     const rows = view === 'Follow-ups'
-      ? db.prepare(`SELECT a.id, ar.appointment_number AS appointmentNumber, COALESCE(NULLIF(p.membership_id, ''), 'Appointment #' || ar.appointment_number) AS membershipId,
+      ? await db.prepare(`SELECT a.id, ar.appointment_number AS appointmentNumber, COALESCE(NULLIF(p.membership_id, ''), 'Appointment #' || ar.appointment_number) AS membershipId,
           a.appointment_date AS date, a.appointment_time AS time, COALESCE(NULLIF(a.visit_category, ''), a.visit_type) AS visit, p.id AS patientId, p.name, d.name AS doctor
         FROM appointments a JOIN appointment_references ar ON ar.appointment_id = a.id JOIN patients p ON p.id = a.patient_id JOIN users d ON d.id = a.doctor_id
         WHERE a.status != 'Cancelled' AND a.visit_type = 'Follow-up' AND a.appointment_date >= ?${doctorOnly ? ' AND a.doctor_id = ?' : ''}
         ORDER BY a.appointment_date, a.appointment_time LIMIT 200`).all(...(doctorOnly ? [today, user.id] : [today]))
-      : db.prepare('SELECT id, title, due_date AS date, status FROM clinic_tasks ORDER BY status != \'Completed\', due_date LIMIT 200').all();
+      : await db.prepare('SELECT id, title, due_date AS date, status FROM clinic_tasks ORDER BY status != \'Completed\', due_date LIMIT 200').all();
     return { view, rows };
   }
   if (view === 'Clinical records' || view === 'Clinical notes' || view === 'Exercise plans') {
@@ -724,7 +838,7 @@ function getWorkspace(user, view, requestedMonth = '', requestedDate = '') {
       const currentMonth = today.slice(0, 7);
       const month = /^\d{4}-(0[1-9]|1[0-2])$/.test(requestedMonth) ? requestedMonth : currentMonth;
       const doctorFilter = user.role === 'doctor' ? ' AND a.doctor_id = ?' : '';
-      const rows = db.prepare(`SELECT a.id, a.patient_id AS patientId, p.name AS patient,
+      const rows = await db.prepare(`SELECT a.id, a.patient_id AS patientId, p.name AS patient,
         COALESCE(NULLIF(p.membership_id, ''), 'Appointment #' || ar.appointment_number) AS membershipId,
         ar.appointment_number AS appointmentNumber, a.session_number AS sessionNumber, p.sessions_prescribed AS sessionsPrescribed,
         p.sessions_reception_updated AS sessionsReceptionUpdated,
@@ -739,13 +853,13 @@ function getWorkspace(user, view, requestedMonth = '', requestedDate = '') {
         WHERE substr(a.appointment_date, 1, 7) = ? AND a.status != 'Cancelled'${doctorFilter}
         ORDER BY a.appointment_date DESC, a.appointment_time DESC`).all(...(user.role === 'doctor' ? [month, user.id] : [month]));
       const archives = user.role === 'admin'
-        ? db.prepare(`SELECT substr(a.appointment_date, 1, 7) AS month, COUNT(*) AS count
+        ? await db.prepare(`SELECT substr(a.appointment_date, 1, 7) AS month, COUNT(*) AS count
             FROM appointments a WHERE a.status != 'Cancelled'
             GROUP BY month HAVING month < ? ORDER BY month DESC`).all(currentMonth)
         : [];
       return { view, rows, month, currentMonth, archives };
     }
-    const rows = db.prepare(`SELECT n.id, n.patient_id AS patientId, p.name AS patient, p.membership_id AS membershipId,
+    const rows = await db.prepare(`SELECT n.id, n.patient_id AS patientId, p.name AS patient, p.membership_id AS membershipId,
       n.appointment_id AS appointmentId, ar.appointment_number AS appointmentNumber, n.note, n.treatment_plan AS treatmentPlan,
       n.next_visit AS nextVisit, n.created_at AS createdAt, d.name AS doctor
       FROM clinical_notes n JOIN patients p ON p.id = n.patient_id JOIN users d ON d.id = n.doctor_id
@@ -756,25 +870,25 @@ function getWorkspace(user, view, requestedMonth = '', requestedDate = '') {
   }
   if (view === 'Clinical archive') {
     const currentMonth = today.slice(0, 7);
-    const rows = db.prepare(`SELECT substr(appointment_date, 1, 7) AS month, COUNT(*) AS count
+    const rows = await db.prepare(`SELECT substr(appointment_date, 1, 7) AS month, COUNT(*) AS count
       FROM appointments WHERE status != 'Cancelled'
       GROUP BY month HAVING month < ? ORDER BY month DESC`).all(currentMonth);
     return { view, rows, currentMonth };
   }
   if (view === 'Reports & audit') {
-    const rows = db.prepare('SELECT l.action, l.entity_type AS entity, l.created_at AS createdAt, l.details_json AS detailsJson, u.name AS staff FROM audit_log l LEFT JOIN users u ON u.id = l.actor_id ORDER BY l.created_at DESC LIMIT 200').all();
-    const months = db.prepare(`SELECT substr(appointment_date, 1, 7) AS month, COUNT(*) AS visits FROM appointments WHERE status != 'Cancelled' GROUP BY month ORDER BY month DESC LIMIT 12`).all();
+    const rows = await db.prepare('SELECT l.action, l.entity_type AS entity, l.created_at AS createdAt, l.details_json AS detailsJson, u.name AS staff FROM audit_log l LEFT JOIN users u ON u.id = l.actor_id ORDER BY l.created_at DESC LIMIT 200').all();
+    const months = await db.prepare(`SELECT substr(appointment_date, 1, 7) AS month, COUNT(*) AS visits FROM appointments WHERE status != 'Cancelled' GROUP BY month ORDER BY month DESC LIMIT 12`).all();
     return { view, rows, months };
   }
   if (view === 'Compliance') {
     const notesColumn = user.role === 'gymkhana' ? '' : ', notes';
-    return { view, rows: db.prepare(`SELECT check_name AS checkName, status${notesColumn}, checked_on AS checkedOn FROM compliance_checks ORDER BY checked_on DESC, created_at DESC LIMIT 200`).all() };
+    return { view, rows: await db.prepare(`SELECT check_name AS checkName, status${notesColumn}, checked_on AS checkedOn FROM compliance_checks ORDER BY checked_on DESC, created_at DESC LIMIT 200`).all() };
   }
   if (view === 'Footfall') {
     const startDate = new Date(`${today}T00:00:00.000Z`);
     startDate.setUTCDate(startDate.getUTCDate() - 30);
     const startDateString = startDate.toISOString().slice(0, 10);
-    const rows = db.prepare(`SELECT a.appointment_date AS date, COUNT(*) AS visits,
+    const rows = await db.prepare(`SELECT a.appointment_date AS date, COUNT(*) AS visits,
       COALESCE(SUM(CASE WHEN pay.payment_status = 'Paid' THEN pay.amount_paisa ELSE 0 END), 0) AS revenuePaisa,
       COALESCE(SUM(pay.club_share_paisa), 0) AS clubSharePaisa
       FROM appointments a LEFT JOIN payments pay ON pay.appointment_id = a.id
@@ -782,7 +896,7 @@ function getWorkspace(user, view, requestedMonth = '', requestedDate = '') {
       GROUP BY a.appointment_date ORDER BY a.appointment_date DESC`).all(startDateString, today);
     const selectedMonth = /^\d{4}-(0[1-9]|1[0-2])$/.test(requestedMonth) ? requestedMonth : today.slice(0, 7);
     const detailRows = requestedDate || requestedMonth
-      ? db.prepare(`SELECT a.appointment_date AS date, ref.appointment_number AS appointmentNumber, a.session_number AS sessionNumber,
+      ? await db.prepare(`SELECT a.appointment_date AS date, ref.appointment_number AS appointmentNumber, a.session_number AS sessionNumber,
           p.name, COALESCE(NULLIF(p.membership_id, ''), 'Appointment #' || ref.appointment_number) AS membershipId,
           p.phone, p.age, p.condition AS issue, p.sessions_prescribed AS sessionsPrescribed,
           a.appointment_time AS time, a.status, COALESCE(pay.amount_paisa, 0) AS amountPaisa,
@@ -793,7 +907,7 @@ function getWorkspace(user, view, requestedMonth = '', requestedDate = '') {
         WHERE ${requestedDate ? 'a.appointment_date = ?' : "substr(a.appointment_date, 1, 7) = ?"} AND a.status != 'Cancelled'
         ORDER BY a.appointment_date DESC, a.appointment_time, p.name LIMIT 2000`).all(requestedDate || selectedMonth)
       : null;
-    return { view, rows, detailRows, detailDate: requestedDate || null, detailMonth: requestedMonth ? selectedMonth : null, summary: { visitsMonth: db.prepare("SELECT COUNT(*) AS count FROM appointments WHERE substr(appointment_date, 1, 7) = ? AND status != 'Cancelled'").get(today.slice(0, 7)).count } };
+    return { view, rows, detailRows, detailDate: requestedDate || null, detailMonth: requestedMonth ? selectedMonth : null, summary: { visitsMonth: (await db.prepare("SELECT COUNT(*) AS count FROM appointments WHERE substr(appointment_date, 1, 7) = ? AND status != 'Cancelled'").get(today.slice(0, 7))).count } };
   }
   if (view === 'Operating hours') {
     return { view, rows: [{ day: 'Monday–Saturday', hours: '14:00–22:00', adherence: 'Tracked from appointments' }, { day: 'Sunday', hours: 'Closed', adherence: 'Scheduled closure' }] };
@@ -814,7 +928,7 @@ async function routeApi(request, response, url) {
   if (['POST', 'PATCH', 'DELETE'].includes(request.method)) assertSameOrigin(request);
 
   if (url.pathname === '/api/setup-status' && request.method === 'GET') {
-    const adminExists = Boolean(db.prepare("SELECT id FROM users WHERE role = 'admin' LIMIT 1").get());
+    const adminExists = Boolean(await db.prepare("SELECT id FROM users WHERE role = 'admin' LIMIT 1").get());
     return sendJson(response, 200, { setupRequired: !adminExists && process.env.NODE_ENV !== 'production' });
   }
 
@@ -828,46 +942,50 @@ async function routeApi(request, response, url) {
     const id = makeId('usr');
     const salt = crypto.randomBytes(16).toString('hex');
     try {
-      db.exec('BEGIN IMMEDIATE');
-      if (db.prepare("SELECT id FROM users WHERE role = 'admin' LIMIT 1").get()) {
-        db.exec('ROLLBACK');
+      await db.exec('BEGIN IMMEDIATE');
+      if (await db.prepare("SELECT id FROM users WHERE role = 'admin' LIMIT 1").get()) {
+        await db.exec('ROLLBACK');
         return sendJson(response, 409, { error: 'Initial setup has already been completed.' });
       }
-      db.prepare('INSERT INTO users (id, email, name, role, password_hash, password_salt) VALUES (?, ?, ?, ?, ?, ?)')
+      await db.prepare('INSERT INTO users (id, email, name, role, password_hash, password_salt) VALUES (?, ?, ?, ?, ?, ?)')
         .run(id, email, name, 'admin', passwordDigest(password, salt), salt);
-      audit(id, 'bootstrap', 'user', id);
-      db.exec('COMMIT');
+      await audit(id, 'bootstrap', 'user', id);
+      await db.exec('COMMIT');
     } catch (error) {
-      if (db.isTransaction) db.exec('ROLLBACK');
+      if (db.isTransaction) await db.exec('ROLLBACK');
       if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') return sendJson(response, 409, { error: 'An account with that email already exists.' });
       throw error;
     }
     const token = crypto.randomBytes(32).toString('base64url');
-    sessions.set(crypto.createHash('sha256').update(token).digest('hex'), { userId: id, expiresAt: Date.now() + sessionHours * 60 * 60 * 1000 });
+    const expiresAt = Date.now() + sessionHours * 60 * 60 * 1000;
+    await db.prepare('INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)')
+      .run(crypto.createHash('sha256').update(token).digest('hex'), id, expiresAt);
     return sendJson(response, 201, { user: { id, email, name, role: 'admin', roleLabel: labels.admin } }, {
       'Set-Cookie': `${cookieName}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${sessionHours * 60 * 60}${process.env.NODE_ENV === 'production' ? '; Secure' : ''}`
     });
   }
 
   if (url.pathname === '/api/login' && request.method === 'POST') {
-    const { key, entry } = limitLogin(request);
+    const key = await limitLogin(request);
     const body = await jsonBody(request, 2000);
     const email = typeof body.email === 'string' ? body.email.trim().toLowerCase().slice(0, 160) : '';
     const password = typeof body.password === 'string' ? body.password : '';
-    const user = db.prepare('SELECT id, email, name, role, password_hash, password_salt, active FROM users WHERE email = ?').get(email);
+    const user = await db.prepare('SELECT id, email, name, role, password_hash, password_salt, active FROM users WHERE email = ?').get(email);
     const candidate = passwordDigest(password.slice(0, 256), user?.password_salt || 'invalid-account-salt');
     const valid = Boolean(user && crypto.timingSafeEqual(Buffer.from(candidate, 'hex'), Buffer.from(user.password_hash, 'hex')));
     if (!valid) {
-      entry.count += 1;
-      loginFailures.set(key, entry);
+      await recordLoginFailure(key);
       return sendJson(response, 401, { error: 'Email or password is incorrect.' });
     }
-    loginFailures.delete(key);
+    await db.prepare('DELETE FROM login_failures WHERE address_hash = ?').run(key);
+    await db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(Date.now());
     if (!user.active) return sendJson(response, 403, { error: 'Account restricted. Please contact your admin.' });
     const token = crypto.randomBytes(32).toString('base64url');
     const digest = crypto.createHash('sha256').update(token).digest('hex');
-    sessions.set(digest, { userId: user.id, expiresAt: Date.now() + sessionHours * 60 * 60 * 1000 });
-    audit(user.id, 'login', 'session');
+    const expiresAt = Date.now() + sessionHours * 60 * 60 * 1000;
+    await db.prepare('INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)')
+      .run(digest, user.id, expiresAt);
+    await audit(user.id, 'login', 'session');
     return sendJson(response, 200, { user: { id: user.id, email: user.email, name: user.name, role: user.role, roleLabel: labels[user.role] } }, {
       'Set-Cookie': `${cookieName}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${sessionHours * 60 * 60}${process.env.NODE_ENV === 'production' ? '; Secure' : ''}`
     });
@@ -875,11 +993,12 @@ async function routeApi(request, response, url) {
 
   if (url.pathname === '/api/logout' && request.method === 'POST') {
     const token = parseCookies(request.headers.cookie)[cookieName];
-    if (token) sessions.delete(crypto.createHash('sha256').update(token).digest('hex'));
+    if (token) await db.prepare('DELETE FROM sessions WHERE token_hash = ?')
+      .run(crypto.createHash('sha256').update(token).digest('hex'));
     return sendJson(response, 200, { ok: true }, { 'Set-Cookie': `${cookieName}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${process.env.NODE_ENV === 'production' ? '; Secure' : ''}` });
   }
 
-  const user = getUser(request);
+  const user = await getUser(request);
   if (url.pathname === '/api/session' && request.method === 'GET') {
     return sendJson(response, 200, { user: user ? { id: user.id, email: user.email, name: user.name, role: user.role, roleLabel: labels[user.role] } : null });
   }
@@ -893,7 +1012,7 @@ async function routeApi(request, response, url) {
     if (currentPassword.length > 256 || newPassword.length < 14 || newPassword.length > 256) {
       return sendJson(response, 400, { error: 'Enter your current password and a new password of 14 to 256 characters.' });
     }
-    const account = db.prepare('SELECT password_hash, password_salt FROM users WHERE id = ?').get(user.id);
+    const account = await db.prepare('SELECT password_hash, password_salt FROM users WHERE id = ?').get(user.id);
     const currentHash = passwordDigest(currentPassword, account.password_salt);
     if (!crypto.timingSafeEqual(Buffer.from(currentHash, 'hex'), Buffer.from(account.password_hash, 'hex'))) {
       return sendJson(response, 403, { error: 'Current password is incorrect.' });
@@ -903,21 +1022,19 @@ async function routeApi(request, response, url) {
       return sendJson(response, 400, { error: 'Choose a new password different from your current password.' });
     }
     const salt = crypto.randomBytes(16).toString('hex');
-    db.prepare('UPDATE users SET password_hash = ?, password_salt = ? WHERE id = ?')
+    await db.prepare('UPDATE users SET password_hash = ?, password_salt = ? WHERE id = ?')
       .run(passwordDigest(newPassword, salt), salt, user.id);
     const currentToken = parseCookies(request.headers.cookie)[cookieName];
     const currentDigest = crypto.createHash('sha256').update(currentToken).digest('hex');
-    for (const [digest, session] of sessions) {
-      if (session.userId === user.id && digest !== currentDigest) sessions.delete(digest);
-    }
-    audit(user.id, 'password_change', 'user', user.id);
+    await db.prepare('DELETE FROM sessions WHERE user_id = ? AND token_hash != ?').run(user.id, currentDigest);
+    await audit(user.id, 'password_change', 'user', user.id);
     return sendJson(response, 200, { ok: true });
   }
 
   const staffPasswordMatch = url.pathname.match(/^\/api\/users\/([A-Za-z0-9_-]+)\/password$/);
   if (staffPasswordMatch && request.method === 'POST') {
     if (user.role !== 'admin') return sendJson(response, 403, { error: 'Only Head / Admin can reset staff passwords.' });
-    const target = db.prepare('SELECT id, role FROM users WHERE id = ? AND email != ?')
+    const target = await db.prepare('SELECT id, role FROM users WHERE id = ? AND email != ?')
       .get(staffPasswordMatch[1], 'former-staff@invalid.local');
     if (!target) return sendJson(response, 404, { error: 'Staff account not found.' });
     if (target.role === 'admin' || target.id === user.id) {
@@ -929,10 +1046,10 @@ async function routeApi(request, response, url) {
       return sendJson(response, 400, { error: 'New password must contain 14 to 256 characters.' });
     }
     const salt = crypto.randomBytes(16).toString('hex');
-    db.prepare('UPDATE users SET password_hash = ?, password_salt = ? WHERE id = ?')
+    await db.prepare('UPDATE users SET password_hash = ?, password_salt = ? WHERE id = ?')
       .run(passwordDigest(newPassword, salt), salt, target.id);
-    revokeUserSessions(target.id);
-    audit(user.id, 'staff_password_reset', 'user', target.id);
+    await revokeUserSessions(target.id);
+    await audit(user.id, 'staff_password_reset', 'user', target.id);
     return sendJson(response, 200, { ok: true });
   }
 
@@ -940,25 +1057,25 @@ async function routeApi(request, response, url) {
     const requestedDate = url.searchParams.get('date');
     const selectedDate = isIsoDate(requestedDate) ? requestedDate : todayString();
     const mode = url.searchParams.get('mode') === 'week' ? 'week' : 'day';
-    return sendJson(response, 200, dashboard(user, selectedDate, mode));
+    return sendJson(response, 200, await dashboard(user, selectedDate, mode));
   }
 
   const memberHistoryMatch = url.pathname.match(/^\/api\/members\/([^/]+)$/);
   if (memberHistoryMatch && request.method === 'GET') {
     if (!requireRole(user, ['admin', 'manager', 'doctor'])) return sendJson(response, 403, { error: 'Member lookup is not available to your role.' });
     const membershipId = decodeURIComponent(memberHistoryMatch[1]).trim().slice(0, 64);
-    const member = db.prepare("SELECT id, membership_id AS membershipId, name, phone, age, sessions_prescribed AS sessionsPrescribed, sessions_reception_updated AS sessionsReceptionUpdated FROM patients WHERE membership_id = ? COLLATE NOCASE AND membership_source = 'gymkhana'").get(membershipId);
+    const member = await db.prepare("SELECT id, membership_id AS membershipId, name, phone, age, sessions_prescribed AS sessionsPrescribed, sessions_reception_updated AS sessionsReceptionUpdated FROM patients WHERE membership_id = ? COLLATE NOCASE AND membership_source = 'gymkhana'").get(membershipId);
     if (!member) return sendJson(response, 404, { error: 'No Gymkhana member found with that membership ID.' });
-    if (user.role === 'doctor' && !db.prepare("SELECT 1 FROM appointments WHERE patient_id = ? AND doctor_id = ? AND status != 'Cancelled' LIMIT 1").get(member.id, user.id)) {
+    if (user.role === 'doctor' && !await db.prepare("SELECT 1 FROM appointments WHERE patient_id = ? AND doctor_id = ? AND status != 'Cancelled' LIMIT 1").get(member.id, user.id)) {
       return sendJson(response, 404, { error: 'Member not found in your assigned caseload.' });
     }
-    const visits = db.prepare(`SELECT a.id, ar.appointment_number AS appointmentNumber, a.appointment_date AS date,
+    const visits = await db.prepare(`SELECT a.id, ar.appointment_number AS appointmentNumber, a.appointment_date AS date,
       a.appointment_time AS time, COALESCE(NULLIF(a.visit_category, ''), a.visit_type) AS visit, a.status, d.name AS doctor
       FROM appointments a JOIN appointment_references ar ON ar.appointment_id = a.id JOIN users d ON d.id = a.doctor_id
       WHERE a.patient_id = ?${user.role === 'doctor' ? ' AND a.doctor_id = ?' : ''}
       ORDER BY a.appointment_date DESC, a.appointment_time DESC LIMIT 100`).all(...(user.role === 'doctor' ? [member.id, user.id] : [member.id]));
     const notes = ['admin', 'doctor'].includes(user.role)
-      ? db.prepare(`SELECT n.id, n.appointment_id AS appointmentId, ar.appointment_number AS appointmentNumber,
+      ? await db.prepare(`SELECT n.id, n.appointment_id AS appointmentId, ar.appointment_number AS appointmentNumber,
           n.note, n.treatment_plan AS treatmentPlan, n.next_visit AS nextVisit, n.created_at AS createdAt, d.name AS doctor
           FROM clinical_notes n JOIN users d ON d.id = n.doctor_id
           LEFT JOIN appointment_references ar ON ar.appointment_id = n.appointment_id
@@ -971,14 +1088,14 @@ async function routeApi(request, response, url) {
   const appointmentLookupMatch = url.pathname.match(/^\/api\/appointment-lookup\/(\d+)$/);
   if (appointmentLookupMatch && request.method === 'GET') {
     if (!requireRole(user, ['admin', 'doctor'])) return sendJson(response, 403, { error: 'Appointment note lookup is limited to doctors and Head / Admin.' });
-    const appointment = db.prepare(`SELECT a.id, ar.appointment_number AS appointmentNumber, a.patient_id AS patientId,
+    const appointment = await db.prepare(`SELECT a.id, ar.appointment_number AS appointmentNumber, a.patient_id AS patientId,
       a.appointment_date AS date, a.appointment_time AS time, COALESCE(NULLIF(a.visit_category, ''), a.visit_type) AS visit, a.status,
       p.name AS patient, p.membership_id AS membershipId, d.name AS doctor, a.doctor_id AS doctorId
       FROM appointment_references ar JOIN appointments a ON a.id = ar.appointment_id
       JOIN patients p ON p.id = a.patient_id JOIN users d ON d.id = a.doctor_id
       WHERE ar.appointment_number = ?`).get(Number(appointmentLookupMatch[1]));
     if (!appointment || user.role === 'doctor' && appointment.doctorId !== user.id) return sendJson(response, 404, { error: 'Appointment not found in your assigned caseload.' });
-    const notes = db.prepare(`SELECT n.id, n.note, n.treatment_plan AS treatmentPlan, n.next_visit AS nextVisit,
+    const notes = await db.prepare(`SELECT n.id, n.note, n.treatment_plan AS treatmentPlan, n.next_visit AS nextVisit,
       n.created_at AS createdAt, d.name AS doctor, ar.appointment_number AS appointmentNumber
       FROM clinical_notes n JOIN users d ON d.id = n.doctor_id
       LEFT JOIN appointment_references ar ON ar.appointment_id = n.appointment_id
@@ -1000,7 +1117,7 @@ async function routeApi(request, response, url) {
         return sendJson(response, 400, { error: 'Choose a date from the last 30 days.' });
       }
     }
-    const workspace = getWorkspace(user, view, requestedMonth, requestedDate);
+    const workspace = await getWorkspace(user, view, requestedMonth, requestedDate);
     return workspace ? sendJson(response, 200, workspace) : sendJson(response, 403, { error: 'This workspace is not available to your role.' });
   }
 
@@ -1008,24 +1125,21 @@ async function routeApi(request, response, url) {
   if (assessmentMatch && ['GET', 'PUT', 'POST'].includes(request.method)) {
     if (!requireRole(user, ['admin', 'manager', 'doctor'])) return sendJson(response, 403, { error: 'Patient assessments are not available to your role.' });
     if (assessmentMatch[2] && request.method !== 'GET') return sendJson(response, 405, { error: 'Assessment PDFs are read-only.' });
-    const appointment = db.prepare(`SELECT a.id, a.doctor_id AS doctorId, a.appointment_date AS appointmentDate,
+    const appointment = await db.prepare(`SELECT a.id, a.doctor_id AS doctorId, a.appointment_date AS appointmentDate,
       COALESCE(NULLIF(a.visit_category, ''), a.visit_type) AS visit, ref.appointment_number AS appointmentNumber,
       p.name AS patientName, p.age, p.phone AS contactNumber, p.membership_id AS membershipId, p.condition
       FROM appointments a JOIN appointment_references ref ON ref.appointment_id = a.id
       JOIN patients p ON p.id = a.patient_id WHERE a.id = ?`).get(assessmentMatch[1]);
     if (!appointment || appointment.visit !== 'New patient') return sendJson(response, 404, { error: 'New-patient appointment not found.' });
-    const savedAssessment = db.prepare(`SELECT assessment_json AS assessmentJson, status, submitted_at AS submittedAt,
+    const savedAssessment = await db.prepare(`SELECT assessment_json AS assessmentJson, status, submitted_at AS submittedAt,
       submitted_by AS submittedBy, updated_at AS updatedAt FROM patient_assessments WHERE appointment_id = ?`).get(appointment.id);
     if (user.role === 'doctor' && appointment.doctorId !== user.id && savedAssessment?.submittedBy !== user.id) {
       return sendJson(response, 404, { error: 'Appointment not found in your assigned caseload.' });
     }
     if (assessmentMatch[2]) {
       if (!savedAssessment) return sendJson(response, 404, { error: 'This assessment has not been saved yet.' });
-      const pdfPath = path.join(assessmentPdfDir, `assessment-${appointment.appointmentNumber}.pdf`);
       try {
         const pdf = await generateAssessmentPdf(appointment.appointmentNumber, savedAssessmentAnswers(savedAssessment.assessmentJson, appointment));
-        fs.mkdirSync(assessmentPdfDir, { recursive: true });
-        fs.writeFileSync(pdfPath, pdf);
         response.writeHead(200, {
           'Content-Type': 'application/pdf',
           'Content-Disposition': `inline; filename="assessment-${appointment.appointmentNumber}.pdf"`,
@@ -1083,27 +1197,17 @@ async function routeApi(request, response, url) {
       }
       throw error;
     }
-    fs.mkdirSync(assessmentPdfDir, { recursive: true });
-    const pdfPath = path.join(assessmentPdfDir, `assessment-${appointment.appointmentNumber}.pdf`);
-    const pdfTempPath = `${pdfPath}.${crypto.randomUUID()}.tmp`;
-    fs.writeFileSync(pdfTempPath, pdf);
     const nextStatus = request.method === 'POST' ? 'Submitted' : savedAssessment?.status || 'Draft';
-    try {
-      db.prepare(`INSERT INTO patient_assessments (appointment_id, assessment_json, status, submitted_at, submitted_by, updated_by)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(appointment_id) DO UPDATE SET assessment_json = excluded.assessment_json,
-          status = excluded.status, submitted_at = COALESCE(patient_assessments.submitted_at, excluded.submitted_at),
-          submitted_by = COALESCE(patient_assessments.submitted_by, excluded.submitted_by),
-          updated_by = excluded.updated_by, updated_at = datetime('now')`)
-        .run(appointment.id, JSON.stringify(answers), nextStatus,
-          request.method === 'POST' ? new Date().toISOString() : null,
-          request.method === 'POST' ? user.id : null, user.id);
-      fs.renameSync(pdfTempPath, pdfPath);
-    } catch (error) {
-      if (fs.existsSync(pdfTempPath)) fs.unlinkSync(pdfTempPath);
-      throw error;
-    }
-    audit(user.id, request.method === 'POST' ? 'patient_assessment_submitted' : 'patient_assessment_saved', 'appointment', appointment.id);
+    await db.prepare(`INSERT INTO patient_assessments (appointment_id, assessment_json, status, submitted_at, submitted_by, updated_by)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(appointment_id) DO UPDATE SET assessment_json = excluded.assessment_json,
+        status = excluded.status, submitted_at = COALESCE(patient_assessments.submitted_at, excluded.submitted_at),
+        submitted_by = COALESCE(patient_assessments.submitted_by, excluded.submitted_by),
+        updated_by = excluded.updated_by, updated_at = datetime('now')`)
+      .run(appointment.id, JSON.stringify(answers), nextStatus,
+        request.method === 'POST' ? new Date().toISOString() : null,
+        request.method === 'POST' ? user.id : null, user.id);
+    await audit(user.id, request.method === 'POST' ? 'patient_assessment_submitted' : 'patient_assessment_saved', 'appointment', appointment.id);
     return sendJson(response, 200, { ok: true, status: nextStatus, answers, pdfUrl: `/api/appointments/${encodeURIComponent(appointment.id)}/assessment.pdf` });
   }
 
@@ -1131,40 +1235,40 @@ async function routeApi(request, response, url) {
     if (!name || !phone || !time || !doctorId || registrationMode === 'membership' && !membershipId) {
       return sendJson(response, 400, { error: 'Name, phone, appointment time, doctor and the selected patient ID are required.' });
     }
-    const doctor = db.prepare("SELECT id FROM users WHERE id = ? AND role = 'doctor' AND active = 1").get(doctorId);
+    const doctor = await db.prepare("SELECT id FROM users WHERE id = ? AND role = 'doctor' AND active = 1").get(doctorId);
     if (!doctor) return sendJson(response, 400, { error: 'Choose an active doctor.' });
     const appointmentId = makeId('apt');
     const paymentId = makeId('pay');
     let patientId;
     let appointmentNumber;
     let existingPatient = false;
-    db.exec('BEGIN IMMEDIATE');
+    await db.exec('BEGIN IMMEDIATE');
     try {
-      const sharedAdminId = membershipId ? db.prepare("SELECT 1 FROM patients WHERE membership_id = ? COLLATE NOCASE AND membership_source = 'admin' LIMIT 1").get(membershipId) : null;
+      const sharedAdminId = membershipId ? await db.prepare("SELECT 1 FROM patients WHERE membership_id = ? COLLATE NOCASE AND membership_source = 'admin' LIMIT 1").get(membershipId) : null;
       if (sharedAdminId) {
-        db.exec('ROLLBACK');
+        await db.exec('ROLLBACK');
         return sendJson(response, 409, { error: 'This is a shared admin-issued ID. Use Appointment ID only for patients without a Gymkhana membership.' });
       }
-      const existingRecord = membershipId ? db.prepare("SELECT id FROM patients WHERE membership_id = ? COLLATE NOCASE AND membership_source = 'gymkhana'").get(membershipId) : null;
+      const existingRecord = membershipId ? await db.prepare("SELECT id FROM patients WHERE membership_id = ? COLLATE NOCASE AND membership_source = 'gymkhana'").get(membershipId) : null;
       existingPatient = Boolean(existingRecord);
       patientId = existingRecord?.id || makeId('pat');
       if (!existingPatient) {
-        db.prepare('INSERT INTO patients (id, name, phone, membership_id, sessions_prescribed, age, condition, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+        await db.prepare('INSERT INTO patients (id, name, phone, membership_id, sessions_prescribed, age, condition, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
           .run(patientId, name, phone, membershipId, sessionsPrescribed, age, condition, user.id);
       } else if (user.role === 'manager' && sessionsPrescribed !== null) {
-        db.prepare('UPDATE patients SET sessions_prescribed = COALESCE(sessions_prescribed, ?) WHERE id = ?')
+        await db.prepare('UPDATE patients SET sessions_prescribed = COALESCE(sessions_prescribed, ?) WHERE id = ?')
           .run(sessionsPrescribed, patientId);
       }
-      const sessionNumber = db.prepare("SELECT COALESCE(MAX(session_number), 0) + 1 AS nextSession FROM appointments WHERE patient_id = ? AND status != 'Cancelled'").get(patientId).nextSession;
-      db.prepare('INSERT INTO appointments (id, patient_id, doctor_id, appointment_date, appointment_time, visit_type, visit_category, session_number, status, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      const sessionNumber = (await db.prepare("SELECT COALESCE(MAX(session_number), 0) + 1 AS nextSession FROM appointments WHERE patient_id = ? AND status != 'Cancelled'").get(patientId)).nextSession;
+      await db.prepare('INSERT INTO appointments (id, patient_id, doctor_id, appointment_date, appointment_time, visit_type, visit_category, session_number, status, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
         .run(appointmentId, patientId, doctorId, date, time, visitType, visitCategory, sessionNumber, 'Waiting', user.id);
-      appointmentNumber = db.prepare('INSERT INTO appointment_references (appointment_id) VALUES (?)').run(appointmentId).lastInsertRowid;
-      db.prepare('INSERT INTO payments (id, appointment_id, amount_paisa, payment_mode, payment_status, recorded_by) VALUES (?, ?, ?, ?, ?, ?)')
+      appointmentNumber = (await db.prepare('INSERT INTO appointment_references (appointment_id) VALUES (?)').run(appointmentId)).lastInsertRowid;
+      await db.prepare('INSERT INTO payments (id, appointment_id, amount_paisa, payment_mode, payment_status, recorded_by) VALUES (?, ?, ?, ?, ?, ?)')
         .run(paymentId, appointmentId, amountPaisa, paymentMode, paymentStatus, user.id);
-      audit(user.id, 'checkin_created', 'appointment', appointmentId);
-      db.exec('COMMIT');
+      await audit(user.id, 'checkin_created', 'appointment', appointmentId);
+      await db.exec('COMMIT');
     } catch (error) {
-      db.exec('ROLLBACK');
+      await db.exec('ROLLBACK');
       throw error;
     }
     return sendJson(response, 201, { ok: true, appointmentId, appointmentNumber, patientId, existingPatient: Boolean(existingPatient), membershipMissing: !membershipId });
@@ -1183,60 +1287,60 @@ async function routeApi(request, response, url) {
     const id = makeId('usr');
     const salt = crypto.randomBytes(16).toString('hex');
     try {
-      db.prepare('INSERT INTO users (id, email, name, role, password_hash, password_salt) VALUES (?, ?, ?, ?, ?, ?)')
+      await db.prepare('INSERT INTO users (id, email, name, role, password_hash, password_salt) VALUES (?, ?, ?, ?, ?, ?)')
         .run(id, email, name, role, passwordDigest(password, salt), salt);
     } catch (error) {
       if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') return sendJson(response, 409, { error: 'An account with that email already exists.' });
       throw error;
     }
-    audit(user.id, 'user_created', 'user', id);
+    await audit(user.id, 'user_created', 'user', id);
     return sendJson(response, 201, { id, email, name, role });
   }
 
   const staffAccessMatch = url.pathname.match(/^\/api\/users\/([A-Za-z0-9_-]+)\/access$/);
   if (staffAccessMatch && request.method === 'PATCH') {
     if (user.role !== 'admin') return sendJson(response, 403, { error: 'Only Head / Admin can restrict staff accounts.' });
-    const target = db.prepare('SELECT id, role FROM users WHERE id = ? AND email != ?').get(staffAccessMatch[1], 'former-staff@invalid.local');
+    const target = await db.prepare('SELECT id, role FROM users WHERE id = ? AND email != ?').get(staffAccessMatch[1], 'former-staff@invalid.local');
     if (!target) return sendJson(response, 404, { error: 'Staff account not found.' });
     if (target.role === 'admin' || target.id === user.id) return sendJson(response, 400, { error: 'You cannot restrict an administrator or your own account.' });
     const body = await jsonBody(request, 1000);
     if (typeof body.active !== 'boolean') return sendJson(response, 400, { error: 'Choose whether this account is active.' });
-    db.prepare('UPDATE users SET active = ? WHERE id = ?').run(body.active ? 1 : 0, target.id);
-    audit(user.id, body.active ? 'staff_access_restored' : 'staff_access_restricted', 'user', target.id);
-    if (!body.active) revokeUserSessions(target.id);
+    await db.prepare('UPDATE users SET active = ? WHERE id = ?').run(body.active ? 1 : 0, target.id);
+    await audit(user.id, body.active ? 'staff_access_restored' : 'staff_access_restricted', 'user', target.id);
+    if (!body.active) await revokeUserSessions(target.id);
     return sendJson(response, 200, { ok: true, active: body.active });
   }
 
   const staffMatch = url.pathname.match(/^\/api\/users\/([A-Za-z0-9_-]+)$/);
   if (staffMatch && request.method === 'DELETE') {
     if (user.role !== 'admin') return sendJson(response, 403, { error: 'Only Head / Admin can delete staff accounts.' });
-    const target = db.prepare('SELECT id, role FROM users WHERE id = ? AND email != ?').get(staffMatch[1], 'former-staff@invalid.local');
+    const target = await db.prepare('SELECT id, role FROM users WHERE id = ? AND email != ?').get(staffMatch[1], 'former-staff@invalid.local');
     if (!target) return sendJson(response, 404, { error: 'Staff account not found.' });
     if (target.role === 'admin' || target.id === user.id) return sendJson(response, 400, { error: 'Administrator accounts cannot be deleted here.' });
-    const formerStaffId = getFormerStaffId();
-    db.exec('BEGIN IMMEDIATE');
+    const formerStaffId = await getFormerStaffId();
+    await db.exec('BEGIN IMMEDIATE');
     try {
-      audit(user.id, 'staff_deleted', 'user', target.id);
-      db.prepare('UPDATE patients SET created_by = ? WHERE created_by = ?').run(formerStaffId, target.id);
-      db.prepare('UPDATE appointments SET doctor_id = ? WHERE doctor_id = ?').run(formerStaffId, target.id);
-      db.prepare('UPDATE appointments SET created_by = ? WHERE created_by = ?').run(formerStaffId, target.id);
-      db.prepare('UPDATE payments SET recorded_by = ? WHERE recorded_by = ?').run(formerStaffId, target.id);
-      db.prepare('UPDATE clinical_notes SET doctor_id = ? WHERE doctor_id = ?').run(formerStaffId, target.id);
-      db.prepare('UPDATE clinic_tasks SET created_by = ?, completed_by = CASE WHEN completed_by = ? THEN ? ELSE completed_by END WHERE created_by = ? OR completed_by = ?')
+      await audit(user.id, 'staff_deleted', 'user', target.id);
+      await db.prepare('UPDATE patients SET created_by = ? WHERE created_by = ?').run(formerStaffId, target.id);
+      await db.prepare('UPDATE appointments SET doctor_id = ? WHERE doctor_id = ?').run(formerStaffId, target.id);
+      await db.prepare('UPDATE appointments SET created_by = ? WHERE created_by = ?').run(formerStaffId, target.id);
+      await db.prepare('UPDATE payments SET recorded_by = ? WHERE recorded_by = ?').run(formerStaffId, target.id);
+      await db.prepare('UPDATE clinical_notes SET doctor_id = ? WHERE doctor_id = ?').run(formerStaffId, target.id);
+      await db.prepare('UPDATE clinic_tasks SET created_by = ?, completed_by = CASE WHEN completed_by = ? THEN ? ELSE completed_by END WHERE created_by = ? OR completed_by = ?')
         .run(formerStaffId, target.id, formerStaffId, target.id, target.id);
-      db.prepare('UPDATE compliance_checks SET checked_by = ? WHERE checked_by = ?').run(formerStaffId, target.id);
-      db.prepare('UPDATE inventory_items SET updated_by = ? WHERE updated_by = ?').run(formerStaffId, target.id);
-      db.prepare('UPDATE expenses SET recorded_by = ? WHERE recorded_by = ?').run(formerStaffId, target.id);
-      db.prepare('UPDATE audit_log SET actor_id = ?, entity_id = CASE WHEN entity_id = ? THEN NULL ELSE entity_id END WHERE actor_id = ?')
+      await db.prepare('UPDATE compliance_checks SET checked_by = ? WHERE checked_by = ?').run(formerStaffId, target.id);
+      await db.prepare('UPDATE inventory_items SET updated_by = ? WHERE updated_by = ?').run(formerStaffId, target.id);
+      await db.prepare('UPDATE expenses SET recorded_by = ? WHERE recorded_by = ?').run(formerStaffId, target.id);
+      await db.prepare('UPDATE audit_log SET actor_id = ?, entity_id = CASE WHEN entity_id = ? THEN NULL ELSE entity_id END WHERE actor_id = ?')
         .run(formerStaffId, target.id, target.id);
-      db.prepare('DELETE FROM users WHERE id = ?').run(target.id);
-      db.exec('COMMIT');
+      await db.prepare('DELETE FROM users WHERE id = ?').run(target.id);
+      await db.exec('COMMIT');
     } catch (error) {
-      if (db.isTransaction) db.exec('ROLLBACK');
+      if (db.isTransaction) await db.exec('ROLLBACK');
       throw error;
     }
-    revokeUserSessions(target.id);
-    audit(user.id, 'staff_deleted', 'user', target.id);
+    await revokeUserSessions(target.id);
+    await audit(user.id, 'staff_deleted', 'user', target.id);
     return sendJson(response, 200, { ok: true });
   }
 
@@ -1248,12 +1352,12 @@ async function routeApi(request, response, url) {
     const treatmentPlan = typeof body.treatmentPlan === 'string' ? body.treatmentPlan.trim().slice(0, 2000) : '';
     const nextVisit = typeof body.nextVisit === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(body.nextVisit) ? body.nextVisit : null;
     if (!appointmentId || !note) return sendJson(response, 400, { error: 'Select an appointment and enter a session note.' });
-    const assignment = db.prepare("SELECT patient_id FROM appointments WHERE id = ? AND status != 'Cancelled' AND (? = 'admin' OR doctor_id = ?)").get(appointmentId, user.role, user.id);
+    const assignment = await db.prepare("SELECT patient_id FROM appointments WHERE id = ? AND status != 'Cancelled' AND (? = 'admin' OR doctor_id = ?)").get(appointmentId, user.role, user.id);
     if (!assignment) return sendJson(response, 404, { error: 'Appointment not found in your assigned caseload.' });
     const noteId = makeId('note');
-    db.prepare('INSERT INTO clinical_notes (id, patient_id, doctor_id, appointment_id, note, treatment_plan, next_visit) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    await db.prepare('INSERT INTO clinical_notes (id, patient_id, doctor_id, appointment_id, note, treatment_plan, next_visit) VALUES (?, ?, ?, ?, ?, ?, ?)')
       .run(noteId, assignment.patient_id, user.id, appointmentId, note, treatmentPlan, nextVisit);
-    audit(user.id, 'clinical_note_created', 'patient', assignment.patient_id);
+    await audit(user.id, 'clinical_note_created', 'patient', assignment.patient_id);
     return sendJson(response, 201, { ok: true, id: noteId });
   }
 
@@ -1264,22 +1368,22 @@ async function routeApi(request, response, url) {
       if (!['In session', 'Completed'].includes(body.status) || Object.keys(body).some(key => key !== 'status')) {
         return sendJson(response, 403, { error: 'Doctors can only start or complete their own assigned appointments.' });
       }
-      const result = db.prepare(`UPDATE appointments SET status = ?
+      const result = await db.prepare(`UPDATE appointments SET status = ?
         WHERE id = ? AND doctor_id = ? AND status != 'Cancelled'
           AND (? != 'In session' OR status != 'Completed')`)
         .run(body.status, appointmentMatch[1], user.id, body.status);
       if (!result.changes) return sendJson(response, 404, { error: 'Appointment not found in your assigned caseload.' });
-      audit(user.id, body.status === 'Completed' ? 'appointment_completed' : 'appointment_started', 'appointment', appointmentMatch[1]);
+      await audit(user.id, body.status === 'Completed' ? 'appointment_completed' : 'appointment_started', 'appointment', appointmentMatch[1]);
       return sendJson(response, 200, { ok: true, status: body.status });
     }
     if (user.role === 'manager') {
       if (Object.keys(body).length !== 1 || !['Waiting', 'In session', 'Completed'].includes(body.status)) {
         return sendJson(response, 403, { error: 'Clinic managers can only change appointment status to Waiting, In progress, or Completed.' });
       }
-      const result = db.prepare("UPDATE appointments SET status = ? WHERE id = ? AND status != 'Cancelled'")
+      const result = await db.prepare("UPDATE appointments SET status = ? WHERE id = ? AND status != 'Cancelled'")
         .run(body.status, appointmentMatch[1]);
       if (!result.changes) return sendJson(response, 404, { error: 'Appointment not found.' });
-      audit(user.id, 'appointment_status_updated', 'appointment', appointmentMatch[1], { status: body.status });
+      await audit(user.id, 'appointment_status_updated', 'appointment', appointmentMatch[1], { status: body.status });
       return sendJson(response, 200, { ok: true, status: body.status });
     }
     if (user.role !== 'admin') return sendJson(response, 403, { error: 'Only Head / Admin can edit appointment scheduling.' });
@@ -1288,15 +1392,15 @@ async function routeApi(request, response, url) {
     const status = ['Confirmed', 'Waiting', 'In session', 'Completed', 'Cancelled'].includes(body.status) ? body.status : '';
     const doctorId = typeof body.doctorId === 'string' ? body.doctorId : '';
     if (!date && !time && !status && !doctorId) return sendJson(response, 400, { error: 'Choose a schedule or status change.' });
-    if (doctorId && !db.prepare("SELECT id FROM users WHERE id = ? AND role = 'doctor' AND active = 1").get(doctorId)) return sendJson(response, 400, { error: 'Choose an active doctor.' });
-    const result = db.prepare(`UPDATE appointments SET
+    if (doctorId && !await db.prepare("SELECT id FROM users WHERE id = ? AND role = 'doctor' AND active = 1").get(doctorId)) return sendJson(response, 400, { error: 'Choose an active doctor.' });
+    const result = await db.prepare(`UPDATE appointments SET
       appointment_date = COALESCE(NULLIF(?, ''), appointment_date),
       appointment_time = COALESCE(NULLIF(?, ''), appointment_time),
       status = COALESCE(NULLIF(?, ''), status),
       doctor_id = COALESCE(NULLIF(?, ''), doctor_id)
       WHERE id = ?`).run(date, time, status, doctorId, appointmentMatch[1]);
     if (!result.changes) return sendJson(response, 404, { error: 'Appointment not found.' });
-    audit(user.id, 'appointment_updated', 'appointment', appointmentMatch[1]);
+    await audit(user.id, 'appointment_updated', 'appointment', appointmentMatch[1]);
     return sendJson(response, 200, { ok: true });
   }
 
@@ -1307,9 +1411,9 @@ async function routeApi(request, response, url) {
     if (Object.keys(body).length !== 1 || !Object.hasOwn(body, 'sessionNumber') || !Number.isSafeInteger(body.sessionNumber) || body.sessionNumber < 1) {
       return sendJson(response, 400, { error: 'Enter a positive whole-number session.' });
     }
-    const result = db.prepare('UPDATE appointments SET session_number = ? WHERE id = ?').run(body.sessionNumber, sessionMatch[1]);
+    const result = await db.prepare('UPDATE appointments SET session_number = ? WHERE id = ?').run(body.sessionNumber, sessionMatch[1]);
     if (!result.changes) return sendJson(response, 404, { error: 'Appointment not found.' });
-    audit(user.id, 'appointment_session_updated', 'appointment', sessionMatch[1]);
+    await audit(user.id, 'appointment_session_updated', 'appointment', sessionMatch[1]);
     return sendJson(response, 200, { ok: true, sessionNumber: body.sessionNumber });
   }
 
@@ -1328,23 +1432,23 @@ async function routeApi(request, response, url) {
     if (paymentMode === null || paymentStatus === null || Number.isNaN(amountPaisa) || Number.isNaN(clubSharePaisa) || !paymentMode && !paymentStatus && amountPaisa === null && clubSharePaisa === null) {
       return sendJson(response, 400, { error: 'Choose a valid payment status and amount.' });
     }
-    const paymentBefore = db.prepare(`SELECT amount_paisa AS amountPaisa, payment_mode AS paymentMode,
+    const paymentBefore = await db.prepare(`SELECT amount_paisa AS amountPaisa, payment_mode AS paymentMode,
       payment_status AS paymentStatus, club_share_paisa AS clubSharePaisa
       FROM payments WHERE appointment_id = ? LIMIT 1`).get(paymentMatch[1]);
     if (!paymentBefore) return sendJson(response, 404, { error: 'Payment record not found.' });
     const nextAmountPaisa = amountPaisa ?? paymentBefore.amountPaisa;
     const nextPaymentStatus = paymentStatus || paymentBefore.paymentStatus;
-    const invoice = db.prepare('SELECT subtotal_paisa AS subtotalPaisa FROM invoices WHERE appointment_id = ?').get(paymentMatch[1]);
+    const invoice = await db.prepare('SELECT subtotal_paisa AS subtotalPaisa FROM invoices WHERE appointment_id = ?').get(paymentMatch[1]);
     const nextAdvancePaisa = nextPaymentStatus === 'Paid' ? nextAmountPaisa : 0;
     if (invoice && nextAdvancePaisa > invoice.subtotalPaisa) {
       return sendJson(response, 409, { error: 'The collected payment cannot exceed the saved invoice subtotal. Update the invoice first.' });
     }
     const result = user.role === 'manager' && amountPaisa !== null
-      ? db.prepare(`UPDATE payments SET
+      ? await db.prepare(`UPDATE payments SET
           payment_status = COALESCE(NULLIF(?, ''), payment_status),
           amount_paisa = ?, amount_manager_updated = 1
           WHERE appointment_id = ? AND amount_manager_updated = 0`).run(paymentStatus || '', amountPaisa, paymentMatch[1])
-      : db.prepare(`UPDATE payments SET
+      : await db.prepare(`UPDATE payments SET
           payment_mode = COALESCE(NULLIF(?, ''), payment_mode),
           payment_status = COALESCE(NULLIF(?, ''), payment_status),
           amount_paisa = COALESCE(?, amount_paisa),
@@ -1352,12 +1456,12 @@ async function routeApi(request, response, url) {
           WHERE appointment_id = ?`).run(paymentMode || '', paymentStatus || '', amountPaisa, clubSharePaisa, paymentMatch[1]);
     if (!result.changes) {
       if (user.role === 'manager' && amountPaisa !== null) {
-        const payment = db.prepare('SELECT amount_manager_updated AS amountManagerUpdated FROM payments WHERE appointment_id = ?').get(paymentMatch[1]);
+        const payment = await db.prepare('SELECT amount_manager_updated AS amountManagerUpdated FROM payments WHERE appointment_id = ?').get(paymentMatch[1]);
         if (payment?.amountManagerUpdated) return sendJson(response, 409, { error: 'Clinic managers can edit the payment amount only once. Ask Head / Admin to correct it.' });
       }
       return sendJson(response, 404, { error: 'Payment record not found.' });
     }
-    const paymentAfter = db.prepare(`SELECT amount_paisa AS amountPaisa, payment_mode AS paymentMode,
+    const paymentAfter = await db.prepare(`SELECT amount_paisa AS amountPaisa, payment_mode AS paymentMode,
       payment_status AS paymentStatus, club_share_paisa AS clubSharePaisa
       FROM payments WHERE appointment_id = ? LIMIT 1`).get(paymentMatch[1]);
     const auditAction = user.role === 'manager' && amountPaisa !== null
@@ -1365,7 +1469,7 @@ async function routeApi(request, response, url) {
       : body.clubSharePaisa !== undefined && Object.keys(body).length === 1
         ? 'club_share_updated'
         : 'payment_updated';
-    audit(user.id, auditAction, 'appointment', paymentMatch[1], {
+    await audit(user.id, auditAction, 'appointment', paymentMatch[1], {
       before: paymentBefore,
       after: paymentAfter
     });
@@ -1375,7 +1479,7 @@ async function routeApi(request, response, url) {
   const invoiceMatch = url.pathname.match(/^\/api\/appointments\/([A-Za-z0-9_-]+)\/invoice$/);
   if (invoiceMatch && ['GET', 'PUT', 'POST'].includes(request.method)) {
     if (!requireRole(user, ['admin', 'manager'])) return sendJson(response, 403, { error: 'Invoices can only be created and printed by clinic managers or Head / Admin.' });
-    const appointment = db.prepare(`SELECT a.id AS appointmentId, ar.appointment_number AS appointmentNumber,
+    const appointment = await db.prepare(`SELECT a.id AS appointmentId, ar.appointment_number AS appointmentNumber,
       a.appointment_date AS appointmentDate, a.appointment_time AS appointmentTime,
       COALESCE(NULLIF(a.visit_category, ''), a.visit_type) AS visit, a.status,
       p.name AS patientName, p.phone AS patientPhone,
@@ -1385,18 +1489,18 @@ async function routeApi(request, response, url) {
       JOIN patients p ON p.id = a.patient_id LEFT JOIN payments pay ON pay.appointment_id = a.id
       WHERE a.id = ?`).get(invoiceMatch[1]);
     if (!appointment) return sendJson(response, 404, { error: 'Appointment not found.' });
-    const invoice = db.prepare(`SELECT invoice_date AS invoiceDate, line_items_json AS lineItemsJson,
+    const invoice = await db.prepare(`SELECT invoice_date AS invoiceDate, line_items_json AS lineItemsJson,
       subtotal_paisa AS subtotalPaisa, advance_paisa AS advancePaisa, updated_at AS updatedAt,
       printed_invoice_json AS printedInvoiceJson, printed_at AS printedAt
       FROM invoices WHERE appointment_id = ?`).get(invoiceMatch[1]);
-    const currentCollectedAdvancePaisa = () => {
-      const payment = db.prepare('SELECT amount_paisa AS amountPaisa, payment_status AS paymentStatus FROM payments WHERE appointment_id = ? LIMIT 1')
+    const currentCollectedAdvancePaisa = async () => {
+      const payment = await db.prepare('SELECT amount_paisa AS amountPaisa, payment_status AS paymentStatus FROM payments WHERE appointment_id = ? LIMIT 1')
         .get(appointment.appointmentId);
       return payment?.paymentStatus === 'Paid' ? payment.amountPaisa : 0;
     };
-    const makeInvoice = (invoiceData, { printedAt = null } = {}) => {
+    const makeInvoice = async (invoiceData, { printedAt = null } = {}) => {
       if (!invoiceData) return null;
-      const advancePaisa = currentCollectedAdvancePaisa();
+      const advancePaisa = await currentCollectedAdvancePaisa();
       return {
         invoiceNumber: `INV-${String(appointment.appointmentNumber).padStart(6, '0')}`,
         invoiceDate: invoiceData.invoiceDate,
@@ -1408,7 +1512,7 @@ async function routeApi(request, response, url) {
       };
     };
     if (request.method === 'GET') {
-      const draftInvoice = makeInvoice(invoice);
+      const draftInvoice = await makeInvoice(invoice);
       const printedInvoice = invoice?.printedInvoiceJson ? {
         ...JSON.parse(invoice.printedInvoiceJson),
         printedAt: invoice.printedAt
@@ -1423,11 +1527,11 @@ async function routeApi(request, response, url) {
 
     if (request.method === 'POST') {
       if (!invoice) return sendJson(response, 404, { error: 'Save the invoice before printing it.' });
-      const printedInvoice = makeInvoice(invoice, { printedAt: new Date().toISOString() });
-      db.prepare(`UPDATE invoices SET printed_invoice_json = ?, printed_at = ?, printed_by = ?
+      const printedInvoice = await makeInvoice(invoice, { printedAt: new Date().toISOString() });
+      await db.prepare(`UPDATE invoices SET printed_invoice_json = ?, printed_at = ?, printed_by = ?
         WHERE appointment_id = ?`)
         .run(JSON.stringify(printedInvoice), printedInvoice.printedAt, user.id, appointment.appointmentId);
-      audit(user.id, 'invoice_printed', 'appointment', appointment.appointmentId);
+      await audit(user.id, 'invoice_printed', 'appointment', appointment.appointmentId);
       return sendJson(response, 200, { ok: true, invoice: printedInvoice });
     }
 
@@ -1461,22 +1565,22 @@ async function routeApi(request, response, url) {
       subtotalPaisa += lineAmountPaisa;
       lineItems.push({ description: item.description.trim(), quantity: item.quantity, unitPricePaisa: item.unitPricePaisa, amountPaisa: lineAmountPaisa });
     }
-    const collectedAdvancePaisa = currentCollectedAdvancePaisa();
+    const collectedAdvancePaisa = await currentCollectedAdvancePaisa();
     if (collectedAdvancePaisa > subtotalPaisa) return sendJson(response, 400, { error: 'The invoice subtotal cannot be less than the amount already recorded as collected.' });
-    const currentInvoice = db.prepare(`SELECT invoice_date AS invoiceDate, subtotal_paisa AS subtotalPaisa
+    const currentInvoice = await db.prepare(`SELECT invoice_date AS invoiceDate, subtotal_paisa AS subtotalPaisa
       FROM invoices WHERE appointment_id = ?`).get(appointment.appointmentId);
     const invoiceBefore = currentInvoice ? {
       invoiceDate: currentInvoice.invoiceDate,
       subtotalPaisa: currentInvoice.subtotalPaisa,
       advancePaisa: collectedAdvancePaisa
     } : null;
-    db.prepare(`INSERT INTO invoices (appointment_id, invoice_date, line_items_json, subtotal_paisa, advance_paisa, updated_by)
+    await db.prepare(`INSERT INTO invoices (appointment_id, invoice_date, line_items_json, subtotal_paisa, advance_paisa, updated_by)
       VALUES (?, ?, ?, ?, ?, ?)
       ON CONFLICT(appointment_id) DO UPDATE SET invoice_date = excluded.invoice_date,
         line_items_json = excluded.line_items_json, subtotal_paisa = excluded.subtotal_paisa,
         advance_paisa = excluded.advance_paisa, updated_by = excluded.updated_by, updated_at = datetime('now')`)
       .run(appointment.appointmentId, body.invoiceDate, JSON.stringify(lineItems), subtotalPaisa, collectedAdvancePaisa, user.id);
-    audit(user.id, currentInvoice ? 'invoice_updated' : 'invoice_created', 'appointment', appointment.appointmentId, {
+    await audit(user.id, currentInvoice ? 'invoice_updated' : 'invoice_created', 'appointment', appointment.appointmentId, {
       before: invoiceBefore,
       after: { invoiceDate: body.invoiceDate, subtotalPaisa, advancePaisa: collectedAdvancePaisa }
     });
@@ -1502,9 +1606,9 @@ async function routeApi(request, response, url) {
     const condition = typeof body.condition === 'string' ? body.condition.trim().slice(0, 100) : '';
     const age = Number.isInteger(body.age) && body.age >= 0 && body.age <= 130 ? body.age : null;
     if (!name || !phone) return sendJson(response, 400, { error: 'Patient name and phone are required.' });
-    const result = db.prepare('UPDATE patients SET name = ?, phone = ?, condition = ?, age = ? WHERE id = ?').run(name, phone, condition, age, patientMatch[1]);
+    const result = await db.prepare('UPDATE patients SET name = ?, phone = ?, condition = ?, age = ? WHERE id = ?').run(name, phone, condition, age, patientMatch[1]);
     if (!result.changes) return sendJson(response, 404, { error: 'Patient not found.' });
-    audit(user.id, 'patient_corrected', 'patient', patientMatch[1]);
+    await audit(user.id, 'patient_corrected', 'patient', patientMatch[1]);
     return sendJson(response, 200, { ok: true });
   }
 
@@ -1514,35 +1618,33 @@ async function routeApi(request, response, url) {
     const appointmentNumber = Number(deletePatientRecordMatch[1]);
     if (!Number.isSafeInteger(appointmentNumber) || appointmentNumber < 1) return sendJson(response, 400, { error: 'Enter a valid appointment ID.' });
 
-    db.exec('BEGIN IMMEDIATE');
-    let assessmentPdfPaths;
+    await db.exec('BEGIN IMMEDIATE');
     let appointmentNumbers;
     let patientId;
     try {
-      const selectedAppointment = db.prepare(`SELECT a.patient_id AS patientId
+      const selectedAppointment = await db.prepare(`SELECT a.patient_id AS patientId
         FROM appointment_references ar JOIN appointments a ON a.id = ar.appointment_id
         WHERE ar.appointment_number = ?`).get(appointmentNumber);
       if (!selectedAppointment) {
-        db.exec('ROLLBACK');
+        await db.exec('ROLLBACK');
         return sendJson(response, 404, { error: 'Appointment not found.' });
       }
       patientId = selectedAppointment.patientId;
-      const appointments = db.prepare(`SELECT a.id, ar.appointment_number AS appointmentNumber
+      const appointments = await db.prepare(`SELECT a.id, ar.appointment_number AS appointmentNumber
         FROM appointments a JOIN appointment_references ar ON ar.appointment_id = a.id
         WHERE a.patient_id = ? ORDER BY ar.appointment_number`).all(patientId);
       appointmentNumbers = appointments.map(appointment => appointment.appointmentNumber);
-      assessmentPdfPaths = deleteAppointmentRecords(appointments);
-      db.prepare('DELETE FROM clinical_notes WHERE patient_id = ?').run(patientId);
-      const removedPatient = db.prepare('DELETE FROM patients WHERE id = ?').run(patientId);
+      await deleteAppointmentRecords(appointments);
+      await db.prepare('DELETE FROM clinical_notes WHERE patient_id = ?').run(patientId);
+      const removedPatient = await db.prepare('DELETE FROM patients WHERE id = ?').run(patientId);
       if (!removedPatient.changes) throw new Error('Patient record could not be deleted.');
-      audit(user.id, 'patient_record_deleted', 'patient', patientId, { selectedAppointmentNumber: appointmentNumber, appointmentNumbers });
-      db.exec('COMMIT');
+      await audit(user.id, 'patient_record_deleted', 'patient', patientId, { selectedAppointmentNumber: appointmentNumber, appointmentNumbers });
+      await db.exec('COMMIT');
     } catch (error) {
-      if (db.isTransaction) db.exec('ROLLBACK');
+      if (db.isTransaction) await db.exec('ROLLBACK');
       throw error;
     }
 
-    removeGeneratedAssessmentPdfs(assessmentPdfPaths);
     return sendJson(response, 200, { ok: true, appointmentNumber, deletedAppointments: appointmentNumbers.length, appointmentNumbers });
   }
 
@@ -1552,31 +1654,29 @@ async function routeApi(request, response, url) {
     const appointmentNumber = Number(deletePatientAppointmentMatch[1]);
     if (!Number.isSafeInteger(appointmentNumber) || appointmentNumber < 1) return sendJson(response, 400, { error: 'Enter a valid appointment ID.' });
 
-    db.exec('BEGIN IMMEDIATE');
-    let assessmentPdfPaths;
+    await db.exec('BEGIN IMMEDIATE');
     let patientRemoved;
     try {
-      const appointment = db.prepare(`SELECT a.id, a.patient_id AS patientId
+      const appointment = await db.prepare(`SELECT a.id, a.patient_id AS patientId
         FROM appointment_references ar JOIN appointments a ON a.id = ar.appointment_id
         WHERE ar.appointment_number = ?`).get(appointmentNumber);
       if (!appointment) {
-        db.exec('ROLLBACK');
+        await db.exec('ROLLBACK');
         return sendJson(response, 404, { error: 'Appointment not found.' });
       }
 
-      assessmentPdfPaths = deleteAppointmentRecords([{ ...appointment, appointmentNumber }]);
-      const removedPatientResult = db.prepare(`DELETE FROM patients WHERE id = ?
+      await deleteAppointmentRecords([{ ...appointment, appointmentNumber }]);
+      const removedPatientResult = await db.prepare(`DELETE FROM patients WHERE id = ?
         AND NOT EXISTS (SELECT 1 FROM appointments WHERE patient_id = ?)
         AND NOT EXISTS (SELECT 1 FROM clinical_notes WHERE patient_id = ?)`)
         .run(appointment.patientId, appointment.patientId, appointment.patientId);
       patientRemoved = Boolean(removedPatientResult.changes);
-      audit(user.id, 'patient_appointment_deleted', 'appointment', appointment.id, { appointmentNumber });
-      db.exec('COMMIT');
+      await audit(user.id, 'patient_appointment_deleted', 'appointment', appointment.id, { appointmentNumber });
+      await db.exec('COMMIT');
     } catch (error) {
-      if (db.isTransaction) db.exec('ROLLBACK');
+      if (db.isTransaction) await db.exec('ROLLBACK');
       throw error;
     }
-    removeGeneratedAssessmentPdfs(assessmentPdfPaths);
     return sendJson(response, 200, { ok: true, appointmentNumber, patientRemoved });
   }
 
@@ -1589,14 +1689,14 @@ async function routeApi(request, response, url) {
       return sendJson(response, 400, { error: 'Enter a whole number of prescribed sessions from 1 to 100.' });
     }
     const result = user.role === 'admin'
-      ? db.prepare('UPDATE patients SET sessions_prescribed = ? WHERE id = ?').run(sessionsPrescribed, patientSessionsMatch[1])
-      : db.prepare('UPDATE patients SET sessions_prescribed = ?, sessions_reception_updated = 1 WHERE id = ? AND sessions_reception_updated = 0').run(sessionsPrescribed, patientSessionsMatch[1]);
+      ? await db.prepare('UPDATE patients SET sessions_prescribed = ? WHERE id = ?').run(sessionsPrescribed, patientSessionsMatch[1])
+      : await db.prepare('UPDATE patients SET sessions_prescribed = ?, sessions_reception_updated = 1 WHERE id = ? AND sessions_reception_updated = 0').run(sessionsPrescribed, patientSessionsMatch[1]);
     if (!result.changes) {
-      const patient = db.prepare('SELECT id FROM patients WHERE id = ?').get(patientSessionsMatch[1]);
+      const patient = await db.prepare('SELECT id FROM patients WHERE id = ?').get(patientSessionsMatch[1]);
       if (!patient) return sendJson(response, 404, { error: 'Patient not found.' });
       if (user.role === 'manager') return sendJson(response, 409, { error: 'Clinic managers can update prescribed sessions only once. Ask Head / Admin to correct it.' });
     }
-    audit(user.id, 'patient_sessions_updated', 'patient', patientSessionsMatch[1]);
+    await audit(user.id, 'patient_sessions_updated', 'patient', patientSessionsMatch[1]);
     return sendJson(response, 200, { ok: true, sessionsPrescribed, receptionUpdated: user.role === 'manager' });
   }
 
@@ -1606,15 +1706,15 @@ async function routeApi(request, response, url) {
     const body = await jsonBody(request, 1000);
     const membershipId = typeof body.membershipId === 'string' ? body.membershipId.trim().slice(0, 64) : '';
     if (!membershipId) return sendJson(response, 400, { error: 'Membership ID is required.' });
-    if (db.prepare("SELECT 1 FROM patients WHERE membership_id = ? COLLATE NOCASE AND membership_source = 'gymkhana' LIMIT 1").get(membershipId)) {
+    if (await db.prepare("SELECT 1 FROM patients WHERE membership_id = ? COLLATE NOCASE AND membership_source = 'gymkhana' LIMIT 1").get(membershipId)) {
       return sendJson(response, 409, { error: 'That ID is already a Gymkhana membership number.' });
     }
-    const result = db.prepare("UPDATE patients SET membership_id = ?, membership_source = 'admin' WHERE id = ? AND membership_id = ''").run(membershipId, patientMembershipMatch[1]);
+    const result = await db.prepare("UPDATE patients SET membership_id = ?, membership_source = 'admin' WHERE id = ? AND membership_id = ''").run(membershipId, patientMembershipMatch[1]);
     if (!result.changes) {
-      const patient = db.prepare('SELECT membership_id FROM patients WHERE id = ?').get(patientMembershipMatch[1]);
+      const patient = await db.prepare('SELECT membership_id FROM patients WHERE id = ?').get(patientMembershipMatch[1]);
       return patient ? sendJson(response, 409, { error: 'This patient already has an ID or the request is no longer available.' }) : sendJson(response, 404, { error: 'Patient record not found.' });
     }
-    audit(user.id, 'membership_id_assigned', 'patient', patientMembershipMatch[1]);
+    await audit(user.id, 'membership_id_assigned', 'patient', patientMembershipMatch[1]);
     return sendJson(response, 200, { ok: true, membershipId });
   }
 
@@ -1625,8 +1725,8 @@ async function routeApi(request, response, url) {
     const dueDate = typeof body.dueDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(body.dueDate) ? body.dueDate : '';
     if (!title || !dueDate) return sendJson(response, 400, { error: 'Task title and due date are required.' });
     const id = makeId('task');
-    db.prepare('INSERT INTO clinic_tasks (id, title, due_date, created_by) VALUES (?, ?, ?, ?)').run(id, title, dueDate, user.id);
-    audit(user.id, 'task_created', 'task', id);
+    await db.prepare('INSERT INTO clinic_tasks (id, title, due_date, created_by) VALUES (?, ?, ?, ?)').run(id, title, dueDate, user.id);
+    await audit(user.id, 'task_created', 'task', id);
     return sendJson(response, 201, { id });
   }
 
@@ -1636,9 +1736,9 @@ async function routeApi(request, response, url) {
     const body = await jsonBody(request, 1000);
     const status = ['Pending', 'In progress', 'Completed'].includes(body.status) ? body.status : '';
     if (!status) return sendJson(response, 400, { error: 'Choose a valid task status.' });
-    const result = db.prepare('UPDATE clinic_tasks SET status = ?, completed_by = ? WHERE id = ?').run(status, status === 'Completed' ? user.id : null, taskMatch[1]);
+    const result = await db.prepare('UPDATE clinic_tasks SET status = ?, completed_by = ? WHERE id = ?').run(status, status === 'Completed' ? user.id : null, taskMatch[1]);
     if (!result.changes) return sendJson(response, 404, { error: 'Task not found.' });
-    audit(user.id, 'task_updated', 'task', taskMatch[1]);
+    await audit(user.id, 'task_updated', 'task', taskMatch[1]);
     return sendJson(response, 200, { ok: true });
   }
 
@@ -1650,8 +1750,8 @@ async function routeApi(request, response, url) {
     const notes = typeof body.notes === 'string' ? body.notes.trim().slice(0, 500) : '';
     if (!checkName || !status) return sendJson(response, 400, { error: 'Check name and status are required.' });
     const id = makeId('check');
-    db.prepare('INSERT INTO compliance_checks (id, check_name, status, notes, checked_by) VALUES (?, ?, ?, ?, ?)').run(id, checkName, status, notes, user.id);
-    audit(user.id, 'compliance_recorded', 'compliance', id);
+    await db.prepare('INSERT INTO compliance_checks (id, check_name, status, notes, checked_by) VALUES (?, ?, ?, ?, ?)').run(id, checkName, status, notes, user.id);
+    await audit(user.id, 'compliance_recorded', 'compliance', id);
     return sendJson(response, 201, { id });
   }
 
@@ -1664,8 +1764,8 @@ async function routeApi(request, response, url) {
     const date = typeof body.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(body.date) ? body.date : todayString();
     if (!category || !description || !amountPaisa) return sendJson(response, 400, { error: 'Category, description and positive amount are required.' });
     const id = makeId('exp');
-    db.prepare('INSERT INTO expenses (id, category, description, amount_paisa, spent_on, recorded_by) VALUES (?, ?, ?, ?, ?, ?)').run(id, category, description, amountPaisa, date, user.id);
-    audit(user.id, 'expense_recorded', 'expense', id);
+    await db.prepare('INSERT INTO expenses (id, category, description, amount_paisa, spent_on, recorded_by) VALUES (?, ?, ?, ?, ?, ?)').run(id, category, description, amountPaisa, date, user.id);
+    await audit(user.id, 'expense_recorded', 'expense', id);
     return sendJson(response, 201, { id });
   }
 
@@ -1679,9 +1779,9 @@ async function routeApi(request, response, url) {
     const reorderAt = Number.isInteger(body.reorderAt) && body.reorderAt >= 0 ? body.reorderAt : -1;
     if (!name || !category || !unit || quantity < 0 || reorderAt < 0) return sendJson(response, 400, { error: 'Enter item, category, unit, quantity and reorder threshold.' });
     const id = makeId('item');
-    db.prepare('INSERT INTO inventory_items (id, name, category, quantity, unit, reorder_at, updated_by) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    await db.prepare('INSERT INTO inventory_items (id, name, category, quantity, unit, reorder_at, updated_by) VALUES (?, ?, ?, ?, ?, ?, ?)')
       .run(id, name, category, quantity, unit, reorderAt, user.id);
-    audit(user.id, 'inventory_item_created', 'inventory', id);
+    await audit(user.id, 'inventory_item_created', 'inventory', id);
     return sendJson(response, 201, { id });
   }
 
@@ -1691,10 +1791,10 @@ async function routeApi(request, response, url) {
     const body = await jsonBody(request, 1000);
     const quantity = Number.isInteger(body.quantity) && body.quantity >= 0 ? body.quantity : -1;
     if (quantity < 0) return sendJson(response, 400, { error: 'Enter a non-negative whole-number stock quantity.' });
-    const result = db.prepare("UPDATE inventory_items SET quantity = ?, updated_by = ?, updated_at = datetime('now') WHERE id = ?")
+    const result = await db.prepare("UPDATE inventory_items SET quantity = ?, updated_by = ?, updated_at = datetime('now') WHERE id = ?")
       .run(quantity, user.id, inventoryMatch[1]);
     if (!result.changes) return sendJson(response, 404, { error: 'Inventory item not found.' });
-    audit(user.id, 'inventory_stock_updated', 'inventory', inventoryMatch[1]);
+    await audit(user.id, 'inventory_stock_updated', 'inventory', inventoryMatch[1]);
     return sendJson(response, 200, { ok: true });
   }
 
@@ -1702,10 +1802,10 @@ async function routeApi(request, response, url) {
   if (patientFullRecordMatch && request.method === 'GET') {
     if (!requireRole(user, ['admin'])) return sendJson(response, 403, { error: 'Patient full records are limited to Head / Admin.' });
     const patientId = patientFullRecordMatch[1];
-    const patient = db.prepare(`SELECT id, name, age, membership_id AS membershipId, sessions_prescribed AS sessionsPrescribed, condition
+    const patient = await db.prepare(`SELECT id, name, age, membership_id AS membershipId, sessions_prescribed AS sessionsPrescribed, condition
       FROM patients WHERE id = ?`).get(patientId);
     if (!patient) return sendJson(response, 404, { error: 'Patient not found.' });
-    const visits = db.prepare(`SELECT a.id, ar.appointment_number AS appointmentNumber,
+    const visits = (await db.prepare(`SELECT a.id, ar.appointment_number AS appointmentNumber,
         a.appointment_date AS date, a.appointment_time AS time,
         COALESCE(NULLIF(a.visit_category, ''), a.visit_type) AS visit,
         a.session_number AS sessionNumber, a.status, d.name AS doctor,
@@ -1715,7 +1815,7 @@ async function routeApi(request, response, url) {
       JOIN users d ON d.id = a.doctor_id
       LEFT JOIN patient_assessments pa ON pa.appointment_id = a.id
       WHERE a.patient_id = ?
-      ORDER BY a.appointment_date DESC, a.appointment_time DESC`).all(patientId)
+      ORDER BY a.appointment_date DESC, a.appointment_time DESC`).all(patientId))
       .map(visit => ({
         ...visit,
         membershipOrAppointmentId: patient.membershipId || `Appointment #${visit.appointmentNumber}`,
@@ -1724,7 +1824,7 @@ async function routeApi(request, response, url) {
       }));
     patient.sessionsCompleted = visits.filter(visit => visit.status === 'Completed').length;
     const visitsById = new Map(visits.map(visit => [visit.id, visit]));
-    const notes = db.prepare(`SELECT n.id, n.appointment_id AS appointmentId, ar.appointment_number AS appointmentNumber,
+    const notes = await db.prepare(`SELECT n.id, n.appointment_id AS appointmentId, ar.appointment_number AS appointmentNumber,
         a.appointment_date AS appointmentDate, a.appointment_time AS appointmentTime,
         n.note, n.treatment_plan AS treatmentPlan, n.next_visit AS nextVisit,
         n.created_at AS createdAt, d.name AS doctor,
@@ -1754,9 +1854,9 @@ async function routeApi(request, response, url) {
   if (patientNotesMatch && request.method === 'GET') {
     if (!requireRole(user, ['admin', 'doctor'])) return sendJson(response, 403, { error: 'Clinical notes are limited to clinicians and Head / Admin.' });
     const patientId = patientNotesMatch[1];
-    const assigned = user.role === 'admin' || db.prepare("SELECT 1 FROM appointments WHERE patient_id = ? AND doctor_id = ? AND status != 'Cancelled' LIMIT 1").get(patientId, user.id);
+    const assigned = user.role === 'admin' || await db.prepare("SELECT 1 FROM appointments WHERE patient_id = ? AND doctor_id = ? AND status != 'Cancelled' LIMIT 1").get(patientId, user.id);
     if (!assigned) return sendJson(response, 404, { error: 'Patient not found in your assigned caseload.' });
-    const notes = db.prepare(`SELECT n.id, n.note, n.treatment_plan AS treatmentPlan, n.next_visit AS nextVisit, n.created_at AS createdAt, u.name AS doctor
+    const notes = await db.prepare(`SELECT n.id, n.note, n.treatment_plan AS treatmentPlan, n.next_visit AS nextVisit, n.created_at AS createdAt, u.name AS doctor
       FROM clinical_notes n JOIN users u ON u.id = n.doctor_id
       WHERE n.patient_id = ?${user.role === 'doctor' ? ' AND n.doctor_id = ?' : ''}
       ORDER BY n.created_at DESC LIMIT 100`).all(...(user.role === 'doctor' ? [patientId, user.id] : [patientId]));
@@ -1778,9 +1878,9 @@ function serveStatic(request, response, url) {
     ['styles.css', path.join(root, 'styles.css')],
     ['secure-app.js', path.join(root, 'secure-app.js')],
     ['hopr.jpeg', path.join(root, 'hopr.jpeg')],
-    ['gymkhana.png', path.join(root, '..', 'gymkhana.png')],
-    ['invoice.png', path.join(root, '..', 'invoice.png')],
-    ['clinic.jpeg', path.join(root, '..', 'clinic.jpeg')]
+    ['gymkhana.png', path.join(root, 'gymkhana.png')],
+    ['invoice.png', path.join(root, 'invoice.png')],
+    ['clinic.jpeg', path.join(root, 'clinic.jpeg')]
   ]);
   const filePath = publicFiles.get(requested);
   if (!filePath) return sendJson(response, 404, { error: 'Not found.' });
@@ -1794,9 +1894,11 @@ function serveStatic(request, response, url) {
   });
 }
 
-const server = http.createServer(async (request, response) => {
+async function handler(request, response) {
+  return requestContext.run({ transaction: null }, async () => {
   try {
-    const url = new URL(request.url, `http://${request.headers.host || 'localhost'}`);
+    await dbReady;
+    const url = new URL(request.url || '/', `http://${request.headers.host || 'localhost'}`);
     if (url.pathname.startsWith('/api/')) return await routeApi(request, response, url);
     if (request.method !== 'GET' && request.method !== 'HEAD') return sendJson(response, 405, { error: 'Method not allowed.' });
     return serveStatic(request, response, url);
@@ -1806,19 +1908,33 @@ const server = http.createServer(async (request, response) => {
     if (status === 500) console.error(error);
     return sendJson(response, status, { error: status === 500 ? 'An unexpected server error occurred.' : error.message });
   }
-});
-
-server.listen(port, host, () => {
-  console.log(`HOPR PMS listening on ${host}:${port}`);
-  if (!db.prepare("SELECT id FROM users WHERE role = 'admin' LIMIT 1").get()) {
-    console.warn(process.env.NODE_ENV === 'production'
-      ? 'No admin account exists. Provision PMS_ADMIN_EMAIL and PMS_ADMIN_PASSWORD using the deployment secret manager.'
-      : 'No admin account exists. Open the local setup page to create one.');
-  }
-});
-
-function shutdown() {
-  server.close(() => { db.close(); process.exit(0); });
+  });
 }
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
+
+module.exports = handler;
+
+if (require.main === module) {
+  const server = http.createServer(handler);
+  dbReady.then(() => {
+    server.listen(port, host, async () => {
+      console.log(`HOPR PMS listening on ${host}:${port}`);
+      if (!await db.prepare("SELECT id FROM users WHERE role = 'admin' LIMIT 1").get()) {
+        console.warn(process.env.NODE_ENV === 'production'
+          ? 'No admin account exists. Provision PMS_ADMIN_EMAIL and PMS_ADMIN_PASSWORD using the deployment secret manager.'
+          : 'No admin account exists. Open the local setup page to create one.');
+      }
+    });
+  }).catch(error => {
+    console.error(error);
+    process.exitCode = 1;
+  });
+
+  function shutdown() {
+    server.close(async () => {
+      await db.close();
+      process.exit(0);
+    });
+  }
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+}
