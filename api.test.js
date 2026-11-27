@@ -24,7 +24,7 @@ test('server enforces sessions, roles, doctor scope and audit masking', async t 
   });
   let child;
   let serverError = '';
-  const serverBootstrap = "const http = require('node:http'); const handler = require('./api'); http.createServer(handler).listen(Number(process.env.PORT), process.env.HOST);";
+  const serverBootstrap = "const http = require('node:http'); const handler = require('./api'); http.createServer((request, response) => { const url = new URL(request.url, 'http://localhost'); request.query = Object.fromEntries(url.searchParams); url.searchParams.delete('__pms_path'); request.url = url.pathname + url.search; handler(request, response); }).listen(Number(process.env.PORT), process.env.HOST);";
   const startServer = () => {
     const childProcess = spawn(process.execPath, ['-e', serverBootstrap], {
       cwd: __dirname,
