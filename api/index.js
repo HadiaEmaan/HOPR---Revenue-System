@@ -8,11 +8,13 @@ module.exports = (request, response) => {
   const queryPath = parsedQuery.__pms_path;
   const forwardedPath = url.searchParams.get('__pms_path')
     || (Array.isArray(queryPath) ? queryPath[0] : queryPath);
+  let targetPath = url.pathname;
   if (typeof forwardedPath === 'string') {
     const originalUrl = new URL(forwardedPath, 'http://localhost');
     if (originalUrl.origin === 'http://localhost'
       && forwardedPath.startsWith('/')
       && !forwardedPath.startsWith('//')) {
+      targetPath = originalUrl.pathname.startsWith('/api/') ? '/api/[route]' : originalUrl.pathname;
       const searchParams = new URLSearchParams(url.search);
       searchParams.delete('__pms_path');
       for (const [key, value] of Object.entries(parsedQuery)) {
@@ -23,6 +25,18 @@ module.exports = (request, response) => {
       }
       request.url = `${originalUrl.pathname}${searchParams.size ? `?${searchParams}` : ''}`;
     }
+  }
+  if (process.env.VERCEL) {
+    const queryKeys = new Set([...url.searchParams.keys(), ...Object.keys(parsedQuery)]);
+    const safeQuery = Object.fromEntries([...queryKeys].map(key => [
+      key,
+      key === '__pms_path' ? targetPath : '[redacted]'
+    ]));
+    console.log('[pms-vercel-request]', {
+      reqUrl: `${url.pathname}${url.search ? '?<redacted>' : ''}`,
+      reqQuery: safeQuery,
+      resolvedTarget: targetPath
+    });
   }
   return serverHandler(request, response);
 };

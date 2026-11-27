@@ -9,12 +9,27 @@ const { pathToFileURL } = require('node:url');
 const { createClient } = require('@libsql/client');
 const { PDFDocument, StandardFonts, rgb } = require('pdf-lib');
 
-const root = __dirname;
+const rootCandidates = [...new Set([
+  __dirname,
+  process.cwd(),
+  path.resolve(__dirname, '..'),
+  path.resolve(process.cwd(), 'PMS')
+])];
+const root = rootCandidates.find(candidate => fs.existsSync(path.resolve(candidate, 'index.html'))) || __dirname;
 const dataDir = path.join(root, 'data');
 const dbPath = process.env.PMS_DB_PATH || path.join(dataDir, 'clinic.sqlite');
 const assessmentTemplatePath = path.join(root, 'Patient History & Assessment Form.pdf');
 const port = Number(process.env.PORT || 7860);
 const host = process.env.HOST || '0.0.0.0';
+if (process.env.VERCEL) {
+  console.log('[pms-static-root]', {
+    moduleDir: __dirname,
+    workingDir: process.cwd(),
+    selectedRoot: root,
+    indexPath: path.resolve(root, 'index.html'),
+    indexExists: fs.existsSync(path.resolve(root, 'index.html'))
+  });
+}
 if (process.env.VERCEL && (!process.env.TURSO_DATABASE_URL || !process.env.TURSO_AUTH_TOKEN)) {
   throw new Error('Vercel deployment requires TURSO_DATABASE_URL and TURSO_AUTH_TOKEN. Set both in Project Settings > Environment Variables, then redeploy.');
 }
@@ -1874,18 +1889,25 @@ function serveStatic(request, response, url) {
     return response.end();
   }
   const publicFiles = new Map([
-    ['index.html', path.join(root, 'index.html')],
-    ['styles.css', path.join(root, 'styles.css')],
-    ['secure-app.js', path.join(root, 'secure-app.js')],
-    ['hopr.jpeg', path.join(root, 'hopr.jpeg')],
-    ['gymkhana.png', path.join(root, 'gymkhana.png')],
-    ['invoice.png', path.join(root, 'invoice.png')],
-    ['clinic.jpeg', path.join(root, 'clinic.jpeg')]
+    ['index.html', path.resolve(root, 'index.html')],
+    ['styles.css', path.resolve(root, 'styles.css')],
+    ['secure-app.js', path.resolve(root, 'secure-app.js')],
+    ['hopr.jpeg', path.resolve(root, 'hopr.jpeg')],
+    ['gymkhana.png', path.resolve(root, 'gymkhana.png')],
+    ['invoice.png', path.resolve(root, 'invoice.png')],
+    ['clinic.jpeg', path.resolve(root, 'clinic.jpeg')]
   ]);
   const filePath = publicFiles.get(requested);
   if (!filePath) return sendJson(response, 404, { error: 'Not found.' });
+  if (!fs.existsSync(filePath)) {
+    console.error('[pms-static-missing]', { requested, root, filePath, workingDir: process.cwd() });
+    return sendJson(response, 404, { error: 'Not found.' });
+  }
   fs.readFile(filePath, (error, content) => {
-    if (error) return sendJson(response, 404, { error: 'Not found.' });
+    if (error) {
+      console.error('[pms-static-read-failed]', { requested, root, filePath, message: error.message });
+      return sendJson(response, 404, { error: 'Not found.' });
+    }
     const cacheControl = ['.js', '.css'].includes(path.extname(filePath)) || filePath.endsWith('index.html')
       ? 'no-cache'
       : 'public, max-age=300';
