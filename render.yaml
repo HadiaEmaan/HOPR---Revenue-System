@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: hopr-clinic-pms
+    runtime: node
+    plan: 0.5c-512mb
+    numInstances: 1
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /api/session
+    disk:
+      name: hopr-pms-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: HOST
+        value: 0.0.0.0
+      - key: NODE_ENV
+        value: production
+      - key: PMS_DB_PATH
+        value: /var/data/clinic.sqlite
+      - key: PMS_PUBLIC_ORIGIN
+        sync: false
+      - key: PMS_ADMIN_EMAIL
+        sync: false
+      - key: PMS_ADMIN_PASSWORD
+        sync: false

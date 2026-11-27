@@ -24,7 +24,7 @@ test('server enforces sessions, roles, doctor scope and audit masking', async t 
   });
   const child = spawn(process.execPath, [path.join(__dirname, 'server.js')], {
     cwd: __dirname,
-    env: { ...process.env, PORT: String(port), PMS_DB_PATH: path.join(tempDir, 'clinic.sqlite'), NODE_ENV: 'test' },
+    env: { ...process.env, PORT: String(port), HOST: '0.0.0.0', PMS_DB_PATH: path.join(tempDir, 'clinic.sqlite'), NODE_ENV: 'test' },
     stdio: ['ignore', 'ignore', 'pipe']
   });
   let serverError = '';

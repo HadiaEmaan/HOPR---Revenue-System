@@ -13,6 +13,7 @@ const dbPath = process.env.PMS_DB_PATH || path.join(dataDir, 'clinic.sqlite');
 const assessmentPdfDir = path.join(path.dirname(dbPath), 'patient-assessments');
 const assessmentTemplatePath = path.join(root, 'Patient History & Assessment Form.pdf');
 const port = Number(process.env.PORT || 4177);
+const host = process.env.HOST || '127.0.0.1';
 const sessionHours = 12;
 const cookieName = 'hopr_session';
 const roles = new Set(['admin', 'manager', 'doctor', 'gymkhana']);
@@ -1807,8 +1808,8 @@ const server = http.createServer(async (request, response) => {
   }
 });
 
-server.listen(port, '127.0.0.1', () => {
-  console.log(`HOPR PMS listening at http://127.0.0.1:${port}`);
+server.listen(port, host, () => {
+  console.log(`HOPR PMS listening on ${host}:${port}`);
   if (!db.prepare("SELECT id FROM users WHERE role = 'admin' LIMIT 1").get()) {
     console.warn(process.env.NODE_ENV === 'production'
       ? 'No admin account exists. Provision PMS_ADMIN_EMAIL and PMS_ADMIN_PASSWORD using the deployment secret manager.'
