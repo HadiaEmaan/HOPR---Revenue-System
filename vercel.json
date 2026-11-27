@@ -11,10 +11,5 @@
       "src": "/(.*)",
       "dest": "server.js"
     }
-  ],
-  "functions": {
-    "server.js": {
-      "includeFiles": "{index.html,styles.css,secure-app.js,hopr.jpeg,gymkhana.png,invoice.png,clinic.jpeg,Patient History & Assessment Form.pdf}"
-    }
-  }
+  ]
 }
