@@ -2038,6 +2038,20 @@ function parseApiPathCandidate(value) {
   return parsed;
 }
 
+function safeRoute(value) {
+  const parsed = parseApiPathCandidate(value);
+  if (parsed) return `/api/${parsed.pathname.split('/')[2] || ''}`;
+  if (typeof value === 'string' && value.startsWith('/')) {
+    try {
+      const parsedPath = new URL(value, 'http://localhost');
+      return parsedPath.pathname === '/api/index' ? '/api/index' : '[non-api]';
+    } catch {
+      return '[invalid]';
+    }
+  }
+  return null;
+}
+
 function apiPathFromSource(value) {
   const directPath = parseApiPathCandidate(value);
   if (directPath) return directPath;
