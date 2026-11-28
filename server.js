@@ -967,7 +967,7 @@ async function getWorkspace(user, view, requestedMonth = '', requestedDate = '')
 
 function contentSecurityHeaders() {
   return {
-    'Content-Security-Policy': "default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'",
+    'Content-Security-Policy': "default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self' https://vercel.live https://*.vercel.live; img-src 'self' data:; connect-src 'self' https://vercel.live https://*.vercel.live wss://*.vercel.live; frame-src https://vercel.live https://*.vercel.live; base-uri 'self'; form-action 'self'; frame-ancestors 'none'",
     'Referrer-Policy': 'same-origin',
     'X-Frame-Options': 'DENY',
     'Permissions-Policy': 'camera=(), microphone=(), geolocation=()'
@@ -1050,7 +1050,8 @@ async function routeApi(request, response, url) {
 
   const user = await getUser(request);
   if (url.pathname === '/api/session' && request.method === 'GET') {
-    return sendJson(response, 200, { user: user ? { id: user.id, email: user.email, name: user.name, role: user.role, roleLabel: labels[user.role] } : null });
+    if (!user) return sendJson(response, 401, { error: 'Authentication required.' });
+    return sendJson(response, 200, { user: { id: user.id, email: user.email, name: user.name, role: user.role, roleLabel: labels[user.role] } });
   }
   if (!user) return sendJson(response, 401, { error: 'Authentication required.' });
 
@@ -1946,16 +1947,31 @@ function serveStatic(request, response, url) {
 
 async function handler(request, response) {
   return requestContext.run({ transaction: null }, async () => {
+  let requestPath = request.url || '/';
+  let stage = 'request parsing';
   try {
+    const url = new URL(requestPath, `http://${request.headers.host || 'localhost'}`);
+    requestPath = url.pathname;
+    stage = 'database initialization';
     await dbReady;
-    const url = new URL(request.url || '/', `http://${request.headers.host || 'localhost'}`);
+    stage = 'request handling';
     if (url.pathname.startsWith('/api/')) return await routeApi(request, response, url);
     if (request.method !== 'GET' && request.method !== 'HEAD') return sendJson(response, 405, { error: 'Method not allowed.' });
     return serveStatic(request, response, url);
   } catch (error) {
-    if (response.headersSent || response.destroyed) return;
     const status = error.status || 500;
-    if (status === 500) console.error(error);
+    if (status === 500) {
+      console.error('[pms-request-error]', {
+        method: request.method,
+        path: requestPath,
+        stage,
+        errorName: error.name,
+        errorCode: error.code,
+        message: error.message,
+        stack: error.stack
+      });
+    }
+    if (response.headersSent || response.destroyed) return;
     return sendJson(response, status, { error: status === 500 ? 'An unexpected server error occurred.' : error.message });
   }
   });

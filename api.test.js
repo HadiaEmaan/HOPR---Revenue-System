@@ -106,11 +106,18 @@ test('server enforces sessions, roles, doctor scope and audit masking', async t 
 
   assert.equal((await request('/api/dashboard')).response.status, 401);
   assert.equal((await request('/api/change-password', { method: 'POST', body: JSON.stringify({ currentPassword: 'x', newPassword: 'x'.repeat(14) }) })).response.status, 401);
-  assert.equal((await request('/api/session')).response.status, 200);
+  const anonymousSession = await request('/api/session');
+  assert.equal(anonymousSession.response.status, 401);
+  assert.equal(anonymousSession.body.error, 'Authentication required.');
   assert.equal((await vercelFetch(`${baseUrl}/server.js`)).status, 404);
   assert.equal((await vercelFetch(`${baseUrl}/api.test.js`)).status, 404);
   assert.equal((await vercelFetch(`${baseUrl}/data/clinic.sqlite`)).status, 404);
-  assert.equal((await vercelFetch(baseUrl)).status, 200);
+  const homepage = await vercelFetch(baseUrl);
+  assert.equal(homepage.status, 200);
+  const contentSecurityPolicy = homepage.headers.get('content-security-policy');
+  assert.match(contentSecurityPolicy, /script-src[^;]*https:\/\/vercel\.live/);
+  assert.match(contentSecurityPolicy, /connect-src[^;]*https:\/\/vercel\.live/);
+  assert.match(contentSecurityPolicy, /frame-src[^;]*https:\/\/vercel\.live/);
   assert.equal((await vercelFetch(`${baseUrl}/index.html`)).status, 200);
   assert.equal((await vercelFetch(`${baseUrl}/styles.css`)).status, 200);
   assert.equal((await vercelFetch(`${baseUrl}/secure-app.js`)).status, 200);
@@ -784,7 +791,9 @@ test('server enforces sessions, roles, doctor scope and audit masking', async t 
   assert.equal((await request(`/api/users/${departingReceptionist.id}/access`, { method: 'PATCH', cookie: manager.cookie, body: JSON.stringify({ active: false }) })).response.status, 403);
   assert.equal((await request(`/api/users/${departingReceptionist.id}`, { method: 'DELETE', cookie: manager.cookie })).response.status, 403);
   assert.equal((await request(`/api/users/${departingReceptionist.id}/access`, { method: 'PATCH', cookie: adminCookie, body: JSON.stringify({ active: false }) })).response.status, 200);
-  assert.equal((await request('/api/session', { cookie: departingReceptionist.cookie })).body.user, null);
+  const revokedSession = await request('/api/session', { cookie: departingReceptionist.cookie });
+  assert.equal(revokedSession.response.status, 401);
+  assert.equal(revokedSession.body.error, 'Authentication required.');
   const restrictedLogin = await request('/api/login', { method: 'POST', body: JSON.stringify({ email: departingReceptionist.email, password: departingReceptionist.password }) });
   assert.equal(restrictedLogin.response.status, 403);
   assert.equal(restrictedLogin.body.error, 'Account restricted. Please contact your admin.');
@@ -796,7 +805,7 @@ test('server enforces sessions, roles, doctor scope and audit masking', async t 
   const restoredCookie = await login(departingReceptionist.email, departingReceptionist.password);
   const deleteResult = await request(`/api/users/${departingReceptionist.id}`, { method: 'DELETE', cookie: adminCookie });
   assert.equal(deleteResult.response.status, 200, JSON.stringify(deleteResult.body));
-  assert.equal((await request('/api/session', { cookie: restoredCookie })).body.user, null);
+  assert.equal((await request('/api/session', { cookie: restoredCookie })).response.status, 401);
   assert.equal((await request('/api/workspace?view=Staff%20%26%20shifts', { cookie: adminCookie })).body.rows.some(row => row.id === departingReceptionist.id), false);
   assert.equal((await request('/api/login', { method: 'POST', body: JSON.stringify({ email: departingReceptionist.email, password: departingReceptionist.password }) })).response.status, 401);
   const followUp = await request('/api/checkins', {
@@ -1095,7 +1104,7 @@ test('server enforces sessions, roles, doctor scope and audit masking', async t 
     body: JSON.stringify({ newPassword: staffResetPassword })
   });
   assert.equal(staffPasswordReset.response.status, 200);
-  assert.equal((await request('/api/session', { cookie: manager.cookie })).body.user, null);
+  assert.equal((await request('/api/session', { cookie: manager.cookie })).response.status, 401);
   assert.equal((await request('/api/login', {
     method: 'POST', body: JSON.stringify({ email: manager.email, password: manager.password })
   })).response.status, 401);

@@ -1641,23 +1641,28 @@ $('#viewAllButton').addEventListener('click', () => {
   loadDashboard();
 });
 
-api('/api/session').then(async result => {
-  setAuthenticated(result.user);
-  if (result.user) return;
+async function showInitialSetupIfRequired() {
   try {
     const status = await api('/api/setup-status');
-    if (status.setupRequired) {
-      $('#loginForm').hidden = true;
-      $('.auth-content > .eyebrow').hidden = true;
-      $('#loginTitle').hidden = true;
-      $('.auth-subtitle').hidden = true;
-      $('#loginError').hidden = true;
-      $('.auth-footnote').hidden = true;
-      $('#setupForm').hidden = false;
-    }
-  } catch { displayError('#loginError', 'Unable to connect to the clinic server. Try again shortly.'); }
-}).catch(() => {
+    if (!status.setupRequired) return;
+    $('#loginForm').hidden = true;
+    $('.auth-content > .eyebrow').hidden = true;
+    $('#loginTitle').hidden = true;
+    $('.auth-subtitle').hidden = true;
+    $('#loginError').hidden = true;
+    $('.auth-footnote').hidden = true;
+    $('#setupForm').hidden = false;
+  } catch (error) {
+    if (error.status !== 401) displayError('#loginError', 'Unable to connect to the clinic server. Try again shortly.');
+  }
+}
+
+api('/api/session').then(async result => {
+  setAuthenticated(result.user);
+  if (!result.user) await showInitialSetupIfRequired();
+}).catch(async error => {
   setAuthenticated(null);
+  if (error.status === 401) return showInitialSetupIfRequired();
   displayError('#loginError', 'Unable to connect to the clinic server. Try again shortly.');
 });
 
