@@ -50,9 +50,10 @@ test('API adapter resolves route paths when req.url is only /api/index', () => {
       { url: '/api/index', headers: { 'x-invoke-path': '/api/setup-status' } },
       { url: '/api/index', headers: { 'x-vercel-matched-path': '/api/index?__pms_path=%2Fapi%2Flogin' } },
       { url: '/api/index', headers: { 'x-now-route-matches': '1=setup-status' } },
-      { url: '/api/index', query: { __pms_path: '/api/login' }, headers: {} }
+      { url: '/api/index', query: { __pms_path: '/api/login' }, headers: {} },
+      { url: '/api/index', headers: {} }
     ];
-    const resolverScript = "const handler = require('./api'); const requests = JSON.parse(process.argv[1]); console.log(JSON.stringify(requests.map(request => handler.resolveRequestPath(request).pathname)));";
+    const resolverScript = "const handler = require('./api'); const requests = JSON.parse(process.argv[1]); console.log(JSON.stringify(requests.map(request => handler.resolveRequestPath(request)?.pathname || null)));";
     const result = spawnSync(process.execPath, ['-e', resolverScript, JSON.stringify(requests)], {
       cwd: __dirname,
       env: { ...process.env, PMS_DB_PATH: path.join(tempDir, 'clinic.sqlite'), NODE_ENV: 'test' },
@@ -65,7 +66,8 @@ test('API adapter resolves route paths when req.url is only /api/index', () => {
       '/api/setup-status',
       '/api/login',
       '/api/setup-status',
-      '/api/login'
+      '/api/login',
+      null
     ]);
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
@@ -188,6 +190,15 @@ test('server handler reconstructs rewritten setup-status and login routes', asyn
     headers: { 'x-now-route-matches': '1=setup-status' }
   });
   assert.equal(routeMatchSetup.status, 200);
+  for (const method of ['GET', 'POST']) {
+    const unresolvedRoute = await fetch(`${baseUrl}/api/index`, {
+      method,
+      headers: method === 'POST' ? { 'Content-Type': 'application/json' } : {},
+      body: method === 'POST' ? '{}' : undefined
+    });
+    assert.equal(unresolvedRoute.status, 404);
+    assert.equal((await unresolvedRoute.json()).error, 'Unable to determine API route.');
+  }
   const loginResponse = await fetch(`${baseUrl}/api/index?__pms_path=%2Fapi%2Flogin`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

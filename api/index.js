@@ -94,7 +94,7 @@ function resolveRequestPath(request, url = new URL(request.url || '/', `http://$
     pathFromRouteMatches(firstString(headers['x-now-route-matches'])),
     url.pathname
   ];
-  return candidates.map(value => value instanceof URL ? value : parseApiPath(value)).find(Boolean) || url;
+  return candidates.map(value => value instanceof URL ? value : parseApiPath(value)).find(Boolean) || null;
 }
 
 const handler = (request, response) => {
@@ -134,7 +134,8 @@ const handler = (request, response) => {
         : '[redacted]';
       return [key, key === '__pms_path' ? safeRoute(value) || '[invalid]' : value];
     }));
-    console.log('[pms-incoming-req]', JSON.stringify({
+    console.log('[pms-debug-path]', JSON.stringify({
+      layer: 'vercel-adapter',
       method: request.method,
       url: safeRequestUrl(rawUrl),
       originalUrl: request.originalUrl ? safeRequestUrl(request.originalUrl) : null,
@@ -148,7 +149,7 @@ const handler = (request, response) => {
       },
       routeMatches: safeRoute(routeMatchPath) || (routeMatches ? '[present]' : null),
       resolvedRoute: targetUrl ? safeRoute(targetUrl.pathname) : safeRoute(url.pathname),
-      resolvedPathname: targetUrl.pathname
+      resolvedPathname: targetUrl ? targetUrl.pathname : url.pathname
     }));
   }
   return serverHandler(request, response);

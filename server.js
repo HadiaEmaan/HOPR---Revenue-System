@@ -2187,6 +2187,16 @@ function apiPathFromSource(value) {
   return parseApiPathCandidate(parsed.searchParams.get('__pms_path'));
 }
 
+function firstHeaderString(value) {
+  if (Array.isArray(value)) return value.find(item => typeof item === 'string');
+  return typeof value === 'string' ? value : undefined;
+}
+
+function safePathSource(value) {
+  const resolvedPath = apiPathFromSource(value);
+  return resolvedPath ? safeRoute(resolvedPath.pathname) : safeRoute(value);
+}
+
 function apiPathFromRouteMatches(value) {
   const directPath = apiPathFromSource(value);
   if (directPath) return `${directPath.pathname}${directPath.search}`;
@@ -2235,10 +2245,10 @@ async function handler(request, response) {
     const targetPath = [
       forwardedPath,
       apiPathFromSource(request.originalUrl),
-      apiPathFromSource(headers['x-vercel-matched-path']),
-      apiPathFromSource(headers['x-matched-path']),
-      apiPathFromSource(headers['x-invoke-path']),
-      apiPathFromRouteMatches(headers['x-now-route-matches']),
+      apiPathFromSource(firstHeaderString(headers['x-vercel-matched-path'])),
+      apiPathFromSource(firstHeaderString(headers['x-matched-path'])),
+      apiPathFromSource(firstHeaderString(headers['x-invoke-path'])),
+      apiPathFromRouteMatches(firstHeaderString(headers['x-now-route-matches'])),
       url.pathname
     ].map(value => value instanceof URL ? value : parseApiPathCandidate(value)).find(Boolean);
     if (targetPath) {
@@ -2267,17 +2277,29 @@ async function handler(request, response) {
         if (key in safeQuery) continue;
         safeQuery[key] = key === '__pms_path' ? safeRoute(String(value)) || '[invalid]' : '[redacted]';
       }
-      console.log('[pms-handler-req]', {
+      console.log('[pms-debug-path]', JSON.stringify({
+        layer: 'server-handler',
         method: request.method,
-        rawUrl: safeApiRequestUrl(rawUrl),
+        url: safeApiRequestUrl(rawUrl),
         originalUrl: request.originalUrl ? safeApiRequestUrl(request.originalUrl) : null,
         query: safeQuery,
+        headers: {
+          matched: safePathSource(firstHeaderString(headers['x-matched-path'])),
+          invoke: safePathSource(firstHeaderString(headers['x-invoke-path'])),
+          vercelUrl: firstHeaderString(headers['x-vercel-deployment-url']) || null,
+          nowMatches: safeRoute(apiPathFromRouteMatches(firstHeaderString(headers['x-now-route-matches'])))
+            || (headers['x-now-route-matches'] ? '[present]' : null),
+          allKeys: Object.keys(headers)
+        },
         resolvedPathname: url.pathname
-      });
+      }));
     }
     if (!url.pathname.startsWith('/api/')) {
       if (request.method !== 'GET' && request.method !== 'HEAD') return sendJson(response, 405, { error: 'Method not allowed.' });
       return serveStatic(request, response, url);
+    }
+    if (url.pathname === '/api/index') {
+      return sendJson(response, 404, { error: 'Unable to determine API route.' });
     }
     stage = 'database initialization';
     await dbReady;
