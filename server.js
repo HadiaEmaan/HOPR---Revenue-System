@@ -65,13 +65,28 @@ if (process.env.VERCEL) {
     taskApiStaticEntries: fs.existsSync('/var/task/api/static') ? fs.readdirSync('/var/task/api/static') : 'missing'
   });
 }
-if (process.env.VERCEL && (!process.env.TURSO_DATABASE_URL || !process.env.TURSO_AUTH_TOKEN)) {
+const tursoDatabaseUrl = process.env.TURSO_DATABASE_URL?.trim();
+const tursoAuthToken = process.env.TURSO_AUTH_TOKEN?.trim();
+if (process.env.VERCEL && (!tursoDatabaseUrl || !tursoAuthToken)) {
   throw new Error('Vercel deployment requires TURSO_DATABASE_URL and TURSO_AUTH_TOKEN. Set both in Project Settings > Environment Variables, then redeploy.');
 }
-const databaseUrl = process.env.TURSO_DATABASE_URL || pathToFileURL(dbPath).href;
+const databaseUrl = tursoDatabaseUrl || pathToFileURL(dbPath).href;
+const databaseRequestTimeoutMs = 3000;
+let initializingDatabase = false;
+
+function databaseFetch(request) {
+  if (!initializingDatabase || !process.env.VERCEL) return globalThis.fetch(request);
+  const timeoutSignal = AbortSignal.timeout(databaseRequestTimeoutMs);
+  const signal = request.signal
+    ? AbortSignal.any([request.signal, timeoutSignal])
+    : timeoutSignal;
+  return globalThis.fetch(request, { signal });
+}
+
 const dbClient = createClient({
   url: databaseUrl,
-  authToken: process.env.TURSO_AUTH_TOKEN
+  authToken: tursoAuthToken || undefined,
+  fetch: process.env.VERCEL ? databaseFetch : undefined
 });
 const requestContext = new AsyncLocalStorage();
 const sessionHours = 12;
@@ -167,8 +182,15 @@ const db = {
   }
 };
 
+const schemaVersion = 1;
+
 async function initializeSchema() {
-if (!process.env.TURSO_DATABASE_URL && !process.env.VERCEL) fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+if (!tursoDatabaseUrl && !process.env.VERCEL) fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+const schemaVersionTable = await db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'pms_schema_version'").get();
+if (schemaVersionTable) {
+  const currentVersion = await db.prepare('SELECT version FROM pms_schema_version LIMIT 1').get();
+  if (Number(currentVersion?.version) >= schemaVersion) return;
+}
 await dbClient.execute('PRAGMA foreign_keys = ON');
 await db.exec(`
   CREATE TABLE IF NOT EXISTS users (
@@ -399,38 +421,116 @@ if (!paymentTableDefinition.includes("'POS'")) {
   }
 }
 await db.prepare('INSERT OR IGNORE INTO appointment_references (appointment_id) SELECT id FROM appointments ORDER BY created_at, id').run();
+await db.exec(`CREATE TABLE IF NOT EXISTS pms_schema_version (version INTEGER NOT NULL);
+  DELETE FROM pms_schema_version;
+  INSERT INTO pms_schema_version (version) VALUES (${schemaVersion})`);
+}
+
+function errorCauseChain(error) {
+  const chain = [];
+  let current = error;
+  while (current && chain.length < 8) {
+    chain.push(current);
+    current = current.cause;
+  }
+  return chain;
+}
+
+function safeDatabaseLogText(value) {
+  let text = String(value || '');
+  for (const secret of [process.env.TURSO_DATABASE_URL, tursoDatabaseUrl, process.env.TURSO_AUTH_TOKEN, tursoAuthToken]) {
+    if (secret) text = text.split(secret).join('[redacted]');
+  }
+  return text.replace(/\b(?:libsql|https?):\/\/[^\s"'<>]+/gi, value => {
+    try {
+      const endpoint = new URL(value);
+      return `${endpoint.protocol}//${endpoint.host}/[redacted]`;
+    } catch {
+      return '[database URL redacted]';
+    }
+  });
+}
+
+function databaseEndpointForLogs() {
+  try {
+    const endpoint = new URL(databaseUrl);
+    return { protocol: endpoint.protocol, host: endpoint.host || '(local)' };
+  } catch {
+    return { protocol: 'unknown', host: 'unknown' };
+  }
+}
+
+function isNetworkDatabaseError(error) {
+  return errorCauseChain(error).some(cause =>
+    cause.code === 'ETIMEDOUT'
+    || (typeof cause.code === 'string' && cause.code.startsWith('UND_ERR_'))
+    || /fetch failed/i.test(cause.message || '')
+  );
+}
+
+function isRetryableDatabaseError(error) {
+  return errorCauseChain(error).some(cause =>
+    ['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT'].includes(cause.code)
+    || /fetch failed/i.test(cause.message || '')
+  );
 }
 
 function errorDetails(error) {
-  const causes = [];
-  let cause = error.cause;
-  while (cause && causes.length < 8) {
-    causes.push({
-      name: cause.name,
-      code: cause.code,
-      message: cause.message,
-      stack: cause.stack
-    });
-    cause = cause.cause;
-  }
+  const causes = errorCauseChain(error).slice(1).map(cause => ({
+    name: cause.name,
+    code: cause.code,
+    message: safeDatabaseLogText(cause.message),
+    stack: safeDatabaseLogText(cause.stack)
+  }));
   return {
     errorName: error.name,
     errorCode: error.code,
-    message: error.message,
-    stack: error.stack,
+    message: safeDatabaseLogText(error.message),
+    stack: safeDatabaseLogText(error.stack),
     causes
   };
 }
 
+async function initializeSchemaWithRetry() {
+  const maxAttempts = 2;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      await initializeSchema();
+      return;
+    } catch (error) {
+      const networkError = isNetworkDatabaseError(error);
+      const retryScheduled = networkError && isRetryableDatabaseError(error) && attempt < maxAttempts;
+      if (networkError) {
+        console.error('[pms-schema-network-error]', JSON.stringify({
+          attempt,
+          maxAttempts,
+          retryScheduled,
+          requestTimeoutMs: databaseRequestTimeoutMs,
+          endpoint: databaseEndpointForLogs(),
+          ...errorDetails(error)
+        }));
+      }
+      if (!retryScheduled) {
+        error.schemaInitAttempts = attempt;
+        throw error;
+      }
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+  }
+}
+
 const dbReady = requestContext.run({ transaction: null }, async () => {
   let initializationPhase = 'schema initialization';
+  initializingDatabase = true;
   try {
-    await initializeSchema();
+    await initializeSchemaWithRetry();
     initializationPhase = 'admin bootstrap';
     await bootstrapAdmin();
   } catch (error) {
     error.initializationPhase = initializationPhase;
     throw error;
+  } finally {
+    initializingDatabase = false;
   }
 });
 dbReady.catch(error => {
@@ -1050,7 +1150,7 @@ async function routeApi(request, response, url) {
         outcome: 'ok',
         adminExists,
         setupRequired,
-        database: process.env.TURSO_DATABASE_URL ? 'turso' : 'local'
+        database: tursoDatabaseUrl ? 'turso' : 'local'
       });
     }
     return sendJson(response, 200, { setupRequired });
