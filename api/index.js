@@ -21,9 +21,22 @@ function parseApiPath(value) {
   return parsed;
 }
 
-function pathFromRouteMatches(value) {
+function apiPathFromSource(value) {
   const directPath = parseApiPath(value);
   if (directPath) return directPath;
+  if (typeof value !== 'string') return null;
+  let parsed;
+  try {
+    parsed = new URL(value, routeOrigin);
+  } catch {
+    return null;
+  }
+  return parseApiPath(parsed.searchParams.get('__pms_path'));
+}
+
+function pathFromRouteMatches(value) {
+  const directPath = apiPathFromSource(value);
+  if (directPath) return `${directPath.pathname}${directPath.search}`;
   if (typeof value !== 'string') return null;
   const matches = new URLSearchParams(value);
   for (const key of ['__pms_path', 'path', 'route', '1']) {
@@ -48,8 +61,24 @@ function safeRoute(value) {
   return null;
 }
 
+function safeRequestUrl(value) {
+  let parsed;
+  try {
+    parsed = new URL(value || '/', routeOrigin);
+  } catch {
+    return '[invalid]';
+  }
+  const query = [...parsed.searchParams].map(([key, item]) => [
+    key,
+    key === '__pms_path' ? safeRoute(item) || '[invalid]' : '[redacted]'
+  ]);
+  const queryString = query.map(([key, item]) => `${encodeURIComponent(key)}=${encodeURIComponent(item)}`).join('&');
+  return `${parsed.pathname}${queryString ? `?${queryString}` : ''}`;
+}
+
 module.exports = (request, response) => {
-  const url = new URL(request.url || '/', `http://${request.headers.host || 'localhost'}`);
+  const rawUrl = request.url || '/';
+  const url = new URL(rawUrl, `http://${request.headers.host || 'localhost'}`);
   const parsedQuery = request.query && typeof request.query === 'object' ? request.query : {};
   const headers = request.headers || {};
   const queryPath = firstString(url.searchParams.get('__pms_path')) || firstString(parsedQuery.__pms_path);
@@ -60,13 +89,13 @@ module.exports = (request, response) => {
   const routeMatchPath = pathFromRouteMatches(routeMatches);
   const targetUrl = [
     queryPath,
-    request.originalUrl,
-    vercelMatchedPath,
-    matchedPath,
-    invokePath,
+    apiPathFromSource(request.originalUrl),
+    apiPathFromSource(vercelMatchedPath),
+    apiPathFromSource(matchedPath),
+    apiPathFromSource(invokePath),
     routeMatchPath,
     url.pathname
-  ].map(parseApiPath).find(Boolean);
+  ].map(value => value instanceof URL ? value : parseApiPath(value)).find(Boolean);
 
   const searchParams = new URLSearchParams(url.search);
   searchParams.delete('__pms_path');
@@ -95,6 +124,7 @@ module.exports = (request, response) => {
     }));
     console.log('[pms-incoming-req]', {
       method: request.method,
+      rawUrl: safeRequestUrl(rawUrl),
       url: safeRoute(url.pathname) || (url.pathname === '/api/index' ? '/api/index' : '[non-api]'),
       originalUrl: safeRoute(request.originalUrl) || null,
       query: safeQuery,
@@ -102,7 +132,8 @@ module.exports = (request, response) => {
       invokePath: safeRoute(invokePath),
       vercelMatchedPath: safeRoute(vercelMatchedPath),
       routeMatches: safeRoute(routeMatchPath) || (routeMatches ? '[present]' : null),
-      resolvedRoute: targetUrl ? safeRoute(targetUrl.pathname) : safeRoute(url.pathname)
+      resolvedRoute: targetUrl ? safeRoute(targetUrl.pathname) : safeRoute(url.pathname),
+      resolvedPathname: targetUrl ? targetUrl.pathname : url.pathname
     });
   }
   return serverHandler(request, response);

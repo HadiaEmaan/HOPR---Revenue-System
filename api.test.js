@@ -164,6 +164,20 @@ test('server handler reconstructs rewritten setup-status and login routes', asyn
   });
   assert.equal(loginResponse.status, 401);
   assert.equal((await loginResponse.json()).error, 'Email or password is incorrect.');
+
+  for (const [header, value] of [
+    ['x-matched-path', '/api/login'],
+    ['x-invoke-path', '/api/index?__pms_path=%2Fapi%2Flogin'],
+    ['x-vercel-matched-path', '/api/index?__pms_path=%2Fapi%2Flogin']
+  ]) {
+    const headerLoginResponse = await fetch(`${baseUrl}/api/index`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', [header]: value },
+      body: JSON.stringify({ email: 'missing@example.test', password: crypto.randomBytes(18).toString('base64url') })
+    });
+    assert.equal(headerLoginResponse.status, 401, `${header} should route to login`);
+    assert.equal((await headerLoginResponse.json()).error, 'Email or password is incorrect.', `${header} should not hit authentication fallback`);
+  }
 });
 
 test('server enforces sessions, roles, doctor scope and audit masking', async t => {
