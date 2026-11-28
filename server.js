@@ -71,7 +71,7 @@ if (process.env.VERCEL && (!tursoDatabaseUrl || !tursoAuthToken)) {
   throw new Error('Vercel deployment requires TURSO_DATABASE_URL and TURSO_AUTH_TOKEN. Set both in Project Settings > Environment Variables, then redeploy.');
 }
 const databaseUrl = tursoDatabaseUrl || pathToFileURL(dbPath).href;
-const databaseRequestTimeoutMs = 3000;
+const databaseRequestTimeoutMs = 20000;
 let initializingDatabase = false;
 
 function databaseFetch(request) {
@@ -542,6 +542,12 @@ dbReady.catch(error => {
 
 function makeId(prefix) { return `${prefix}_${crypto.randomUUID()}`; }
 function passwordDigest(password, salt) { return crypto.pbkdf2Sync(password, salt, 310000, 32, 'sha256').toString('hex'); }
+function passwordHashMatches(password, salt, storedHash) {
+  if (typeof salt !== 'string' || typeof storedHash !== 'string' || !/^[a-f\d]{64}$/i.test(storedHash)) return false;
+  const expected = Buffer.from(storedHash, 'hex');
+  const candidate = Buffer.from(passwordDigest(password, salt), 'hex');
+  return expected.length === candidate.length && crypto.timingSafeEqual(expected, candidate);
+}
 async function audit(actorId, action, entityType, entityId, details = null) {
   await db.prepare('INSERT INTO audit_log (id, actor_id, action, entity_type, entity_id, details_json) VALUES (?, ?, ?, ?, ?, ?)')
     .run(makeId('evt'), actorId || null, action, entityType, entityId || null, details === null ? null : JSON.stringify(details));
@@ -590,23 +596,39 @@ async function bootstrapAdmin() {
   if (!email || !password || password.length < 14) {
     throw new Error('Set both PMS_ADMIN_EMAIL and PMS_ADMIN_PASSWORD (at least 14 characters).');
   }
-  const salt = crypto.randomBytes(16).toString('hex');
-  const passwordHash = passwordDigest(password, salt);
+  const existingUser = await db.prepare('SELECT id, role, active, password_hash, password_salt FROM users WHERE email = ? COLLATE NOCASE LIMIT 1').get(email);
+  if (existingUser
+    && existingUser.role === 'admin'
+    && Number(existingUser.active) === 1
+    && passwordHashMatches(password, existingUser.password_salt, existingUser.password_hash)) {
+    if (process.env.VERCEL) console.info('[pms-admin-bootstrap]', { outcome: 'already_current' });
+    return;
+  }
+
   let outcome;
   await db.exec('BEGIN IMMEDIATE');
   try {
-    const matchingUser = await db.prepare('SELECT id FROM users WHERE email = ? COLLATE NOCASE LIMIT 1').get(email);
+    const matchingUser = await db.prepare('SELECT id, role, active, password_hash, password_salt FROM users WHERE email = ? COLLATE NOCASE LIMIT 1').get(email);
     if (matchingUser) {
-      await db.prepare("UPDATE users SET email = ?, role = 'admin', active = 1, password_hash = ?, password_salt = ? WHERE id = ?")
-        .run(email, passwordHash, salt, matchingUser.id);
-      await revokeUserSessions(matchingUser.id);
-      await audit(matchingUser.id, 'bootstrap_admin_reset', 'user', matchingUser.id);
-      outcome = 'updated_existing_user';
+      const passwordMatches = passwordHashMatches(password, matchingUser.password_salt, matchingUser.password_hash);
+      if (matchingUser.role === 'admin' && Number(matchingUser.active) === 1 && passwordMatches) {
+        outcome = 'already_current';
+      } else {
+        const salt = passwordMatches ? matchingUser.password_salt : crypto.randomBytes(16).toString('hex');
+        const passwordHash = passwordMatches ? matchingUser.password_hash : passwordDigest(password, salt);
+        await db.prepare("UPDATE users SET email = ?, role = 'admin', active = 1, password_hash = ?, password_salt = ? WHERE id = ?")
+          .run(email, passwordHash, salt, matchingUser.id);
+        await revokeUserSessions(matchingUser.id);
+        await audit(matchingUser.id, 'bootstrap_admin_reset', 'user', matchingUser.id);
+        outcome = 'updated_existing_user';
+      }
     } else {
       const existingAdmin = await db.prepare('SELECT id FROM users WHERE role = ? LIMIT 1').get('admin');
       if (existingAdmin) {
         outcome = 'existing_admin_preserved';
       } else {
+        const salt = crypto.randomBytes(16).toString('hex');
+        const passwordHash = passwordDigest(password, salt);
         const id = makeId('usr');
         await db.prepare('INSERT INTO users (id, email, name, role, password_hash, password_salt) VALUES (?, ?, ?, ?, ?, ?)')
           .run(id, email, email.split('@')[0], 'admin', passwordHash, salt);

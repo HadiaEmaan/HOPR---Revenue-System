@@ -1351,4 +1351,38 @@ test('server enforces sessions, roles, doctor scope and audit masking', async t 
   assert.equal((await request('/api/login', {
     method: 'POST', body: JSON.stringify({ email: manager.email, password: staffResetPassword })
   })).response.status, 401);
+
+  const bootstrapStateDb = new DatabaseSync(path.join(tempDir, 'clinic.sqlite'));
+  const bootstrapStateBefore = bootstrapStateDb.prepare('SELECT password_hash, password_salt FROM users WHERE id = ?').get(manager.id);
+  const bootstrapSessionsBefore = bootstrapStateDb.prepare('SELECT COUNT(*) AS count FROM sessions WHERE user_id = ?').get(manager.id).count;
+  const bootstrapAuditsBefore = bootstrapStateDb.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE actor_id = ? AND action = 'bootstrap_admin_reset'").get(manager.id).count;
+  bootstrapStateDb.close();
+
+  const bootstrapProcess = child;
+  const bootstrapProcessExit = new Promise(resolve => bootstrapProcess.once('exit', resolve));
+  bootstrapProcess.kill();
+  await bootstrapProcessExit;
+  child = startServer({ PMS_ADMIN_EMAIL: manager.email, PMS_ADMIN_PASSWORD: promotedPassword });
+  ready = false;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (child.exitCode !== null) break;
+    try {
+      const response = await fetch(`${baseUrl}/api/session`);
+      if (response.status === 401) {
+        ready = true;
+        break;
+      }
+    } catch { await new Promise(resolve => setTimeout(resolve, 50)); }
+  }
+  assert.equal(ready, true, `server did not preserve the bootstrapped admin: ${serverError}`);
+  const retainedBootstrapSession = await request('/api/session', { cookie: promotedLogin.cookie });
+  assert.equal(retainedBootstrapSession.response.status, 200);
+  const bootstrapStateAfterRestartDb = new DatabaseSync(path.join(tempDir, 'clinic.sqlite'));
+  const bootstrapStateAfter = bootstrapStateAfterRestartDb.prepare('SELECT password_hash, password_salt FROM users WHERE id = ?').get(manager.id);
+  const bootstrapSessionsAfter = bootstrapStateAfterRestartDb.prepare('SELECT COUNT(*) AS count FROM sessions WHERE user_id = ?').get(manager.id).count;
+  const bootstrapAuditsAfter = bootstrapStateAfterRestartDb.prepare("SELECT COUNT(*) AS count FROM audit_log WHERE actor_id = ? AND action = 'bootstrap_admin_reset'").get(manager.id).count;
+  bootstrapStateAfterRestartDb.close();
+  assert.deepEqual(bootstrapStateAfter, bootstrapStateBefore);
+  assert.equal(bootstrapSessionsAfter, bootstrapSessionsBefore);
+  assert.equal(bootstrapAuditsAfter, bootstrapAuditsBefore);
 });
