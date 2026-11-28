@@ -2,6 +2,34 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "rewrites": [
     {
+      "source": "/api/session",
+      "destination": "/api/index?__pms_path=/api/session"
+    },
+    {
+      "source": "/api/setup-status",
+      "destination": "/api/index?__pms_path=/api/setup-status"
+    },
+    {
+      "source": "/api/login",
+      "destination": "/api/index?__pms_path=/api/login"
+    },
+    {
+      "source": "/api/setup",
+      "destination": "/api/index?__pms_path=/api/setup"
+    },
+    {
+      "source": "/api/logout",
+      "destination": "/api/index?__pms_path=/api/logout"
+    },
+    {
+      "source": "/api/dashboard",
+      "destination": "/api/index?__pms_path=/api/dashboard"
+    },
+    {
+      "source": "/api/workspace",
+      "destination": "/api/index?__pms_path=/api/workspace"
+    },
+    {
       "source": "/api/:path*",
       "destination": "/api/index?__pms_path=/api/:path*"
     }

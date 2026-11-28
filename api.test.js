@@ -31,6 +31,15 @@ test('Vercel-bundled static assets stay in sync with root assets', () => {
   }
 });
 
+test('Vercel routes auth and initial workspace requests to their exact API paths', () => {
+  const config = JSON.parse(fs.readFileSync(path.join(__dirname, 'vercel.json'), 'utf8'));
+  const rewrites = new Map(config.rewrites.map(rewrite => [rewrite.source, rewrite.destination]));
+  for (const route of ['/api/session', '/api/setup-status', '/api/login', '/api/setup', '/api/logout', '/api/dashboard', '/api/workspace']) {
+    assert.equal(rewrites.get(route), `/api/index?__pms_path=${route}`);
+  }
+  assert.equal(config.rewrites.at(-1).source, '/api/:path*');
+});
+
 test('static pages remain available when database initialization fails', async t => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hopr-pms-static-test-'));
   const databasePath = path.join(tempDir, 'broken.sqlite');
