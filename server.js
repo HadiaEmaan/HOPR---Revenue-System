@@ -13,18 +13,20 @@ const rootCandidates = [...new Set([
   __dirname,
   process.cwd(),
   path.resolve(__dirname, '..'),
-  path.resolve(process.cwd(), 'PMS')
+  path.resolve(__dirname, '..', '..'),
+  path.resolve(process.cwd(), '..'),
+  path.resolve(process.cwd(), '..', '..'),
+  path.resolve(process.cwd(), 'PMS'),
+  path.resolve(__dirname, 'PMS')
 ])];
 const root = rootCandidates.find(candidate => fs.existsSync(path.resolve(candidate, 'index.html'))) || __dirname;
 const staticRootCandidates = [...new Set([
   root,
+  ...rootCandidates,
   __dirname,
   path.resolve(__dirname, 'api'),
-  path.resolve(__dirname, '..'),
-  path.resolve(__dirname, '..', '..'),
   process.cwd(),
-  path.resolve(process.cwd(), 'api'),
-  path.resolve(process.cwd(), 'PMS')
+  path.resolve(process.cwd(), 'api')
 ])];
 const dataDir = path.join(root, 'data');
 const dbPath = process.env.PMS_DB_PATH || path.join(dataDir, 'clinic.sqlite');
@@ -42,8 +44,8 @@ if (process.env.VERCEL) {
       root: candidate,
       indexExists: fs.existsSync(path.resolve(candidate, 'index.html'))
     })),
-    taskRootEntries: fs.existsSync('/var/task') ? fs.readdirSync('/var/task') : null,
-    taskApiEntries: fs.existsSync('/var/task/api') ? fs.readdirSync('/var/task/api') : null
+    taskRootEntries: fs.existsSync('/var/task') ? fs.readdirSync('/var/task') : 'missing',
+    taskApiEntries: fs.existsSync('/var/task/api') ? fs.readdirSync('/var/task/api') : 'missing'
   });
 }
 if (process.env.VERCEL && (!process.env.TURSO_DATABASE_URL || !process.env.TURSO_AUTH_TOKEN)) {
