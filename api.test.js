@@ -88,6 +88,8 @@ test('static pages remain available when database initialization fails', async t
   assert.equal(apiResponse.status, 500);
   assert.match(serverError, /\[pms-request-error\]/);
   assert.match(serverError, /stage: 'database initialization'/);
+  assert.match(serverError, /causes: \[/);
+  assert.match(serverError, /code: 'SQLITE_NOTADB'/);
 });
 
 test('server handler reconstructs rewritten setup-status and login routes', async t => {

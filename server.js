@@ -401,16 +401,42 @@ if (!paymentTableDefinition.includes("'POS'")) {
 await db.prepare('INSERT OR IGNORE INTO appointment_references (appointment_id) SELECT id FROM appointments ORDER BY created_at, id').run();
 }
 
-const dbReady = requestContext.run({ transaction: null }, async () => {
-  await initializeSchema();
-  await bootstrapAdmin();
-});
-dbReady.catch(error => {
-  console.error('[pms-database-initialization-failed]', {
+function errorDetails(error) {
+  const causes = [];
+  let cause = error.cause;
+  while (cause && causes.length < 8) {
+    causes.push({
+      name: cause.name,
+      code: cause.code,
+      message: cause.message,
+      stack: cause.stack
+    });
+    cause = cause.cause;
+  }
+  return {
     errorName: error.name,
     errorCode: error.code,
     message: error.message,
-    stack: error.stack
+    stack: error.stack,
+    causes
+  };
+}
+
+const dbReady = requestContext.run({ transaction: null }, async () => {
+  let initializationPhase = 'schema initialization';
+  try {
+    await initializeSchema();
+    initializationPhase = 'admin bootstrap';
+    await bootstrapAdmin();
+  } catch (error) {
+    error.initializationPhase = initializationPhase;
+    throw error;
+  }
+});
+dbReady.catch(error => {
+  console.error('[pms-database-initialization-failed]', {
+    initializationPhase: error.initializationPhase,
+    ...errorDetails(error)
   });
 });
 
@@ -2081,10 +2107,8 @@ async function handler(request, response) {
         method: request.method,
         path: requestPath,
         stage,
-        errorName: error.name,
-        errorCode: error.code,
-        message: error.message,
-        stack: error.stack
+        initializationPhase: error.initializationPhase,
+        ...errorDetails(error)
       });
     }
     if (response.headersSent || response.destroyed) return;
