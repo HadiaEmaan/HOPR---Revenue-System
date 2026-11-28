@@ -145,6 +145,16 @@ test('server handler reconstructs rewritten setup-status and login routes', asyn
   });
   assert.equal(parsedQuerySetupStatus.status, 200);
   assert.equal((await parsedQuerySetupStatus.json()).setupRequired, true);
+  for (const header of ['x-matched-path', 'x-invoke-path', 'x-vercel-matched-path']) {
+    const headerRoutedSetup = await fetch(`${baseUrl}/api/index`, {
+      headers: { [header]: '/api/setup-status' }
+    });
+    assert.equal(headerRoutedSetup.status, 200, `${header} should recover the original route`);
+  }
+  const routeMatchSetup = await fetch(`${baseUrl}/api/index`, {
+    headers: { 'x-now-route-matches': '1=setup-status' }
+  });
+  assert.equal(routeMatchSetup.status, 200);
   const loginResponse = await fetch(`${baseUrl}/api/index?__pms_path=%2Fapi%2Flogin`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -265,6 +275,14 @@ test('server enforces sessions, roles, doctor scope and audit masking', async t 
   });
   assert.equal(matchedPathSetupStatus.status, 200);
   assert.equal((await matchedPathSetupStatus.json()).setupRequired, true);
+  const vercelMatchedSetupStatus = await fetch(`${baseUrl}/api/index`, {
+    headers: { 'x-vercel-matched-path': '/api/setup-status' }
+  });
+  assert.equal(vercelMatchedSetupStatus.status, 200);
+  const routeMatchedSetupStatus = await fetch(`${baseUrl}/api/index`, {
+    headers: { 'x-now-route-matches': '1=setup-status' }
+  });
+  assert.equal(routeMatchedSetupStatus.status, 200);
   const setup = await request('/api/setup', { method: 'POST', body: JSON.stringify({ name: 'Clinic Admin', email: 'admin@example.test', password }) });
   assert.equal(setup.response.status, 201, JSON.stringify(setup.body));
   let adminCookie = setup.cookie;

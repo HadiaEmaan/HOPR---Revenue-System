@@ -1999,6 +1999,36 @@ function serveStatic(request, response, url) {
   });
 }
 
+function parseApiPathCandidate(value) {
+  if (typeof value !== 'string' || !value.startsWith('/') || value.startsWith('//')) return null;
+  const parsed = new URL(value, 'http://localhost');
+  if (parsed.origin !== 'http://localhost'
+    || !parsed.pathname.startsWith('/api/')
+    || parsed.pathname === '/api/index'
+    || parsed.pathname.includes(':')
+    || parsed.pathname.includes('*')
+    || parsed.pathname.includes('[')
+    || parsed.pathname.includes(']')) return null;
+  return parsed;
+}
+
+function apiPathFromRouteMatches(value) {
+  const directPath = parseApiPathCandidate(value);
+  if (directPath) return `${directPath.pathname}${directPath.search}`;
+  if (typeof value !== 'string') return null;
+  const matches = new URLSearchParams(value);
+  for (const key of ['__pms_path', 'path', 'route', '1']) {
+    const matchedValue = matches.get(key);
+    if (typeof matchedValue !== 'string' || !matchedValue) continue;
+    const candidate = matchedValue.startsWith('/api/')
+      ? matchedValue
+      : `/api/${matchedValue.replace(/^\/+/, '')}`;
+    const parsed = parseApiPathCandidate(candidate);
+    if (parsed) return `${parsed.pathname}${parsed.search}`;
+  }
+  return null;
+}
+
 async function handler(request, response) {
   return requestContext.run({ transaction: null }, async () => {
   let requestPath = request.url || '/';
@@ -2008,27 +2038,32 @@ async function handler(request, response) {
     const requestQuery = request.query && typeof request.query === 'object' ? request.query : {};
     const queryPath = requestQuery.__pms_path;
     const forwardedPath = url.searchParams.get('__pms_path')
-      || (Array.isArray(queryPath) ? queryPath[0] : queryPath);
-    if (typeof forwardedPath === 'string' && forwardedPath) {
-      const originalUrl = new URL(forwardedPath, 'http://localhost');
-      if (originalUrl.origin === 'http://localhost'
-        && forwardedPath.startsWith('/api/')
-        && !forwardedPath.startsWith('//')) {
-        const searchParams = new URLSearchParams(url.search);
-        searchParams.delete('__pms_path');
-        for (const [key, value] of Object.entries(requestQuery)) {
-          if (key === '__pms_path' || searchParams.has(key)) continue;
-          for (const item of Array.isArray(value) ? value : [value]) {
-            if (typeof item === 'string') searchParams.append(key, item);
-          }
+      || (Array.isArray(queryPath) ? queryPath.find(item => typeof item === 'string') : queryPath);
+    const headers = request.headers || {};
+    const targetPath = [
+      forwardedPath,
+      request.originalUrl,
+      headers['x-vercel-matched-path'],
+      headers['x-matched-path'],
+      headers['x-invoke-path'],
+      apiPathFromRouteMatches(headers['x-now-route-matches']),
+      url.pathname
+    ].map(parseApiPathCandidate).find(Boolean);
+    if (targetPath) {
+      const searchParams = new URLSearchParams(url.search);
+      searchParams.delete('__pms_path');
+      for (const [key, value] of Object.entries(requestQuery)) {
+        if (key === '__pms_path' || searchParams.has(key)) continue;
+        for (const item of Array.isArray(value) ? value : [value]) {
+          if (typeof item === 'string') searchParams.append(key, item);
         }
-        for (const [key, value] of originalUrl.searchParams) {
-          if (!searchParams.has(key)) searchParams.append(key, value);
-        }
-        url.pathname = originalUrl.pathname;
-        url.search = searchParams.toString();
-        request.url = `${url.pathname}${url.search ? `?${url.searchParams}` : ''}`;
       }
+      for (const [key, value] of targetPath.searchParams) {
+        if (!searchParams.has(key)) searchParams.append(key, value);
+      }
+      url.pathname = targetPath.pathname;
+      url.search = searchParams.toString();
+      request.url = `${url.pathname}${url.search ? `?${url.searchParams}` : ''}`;
     }
     requestPath = url.pathname;
     if (!url.pathname.startsWith('/api/')) {

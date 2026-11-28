@@ -11,8 +11,31 @@ function firstString(value) {
 function parseApiPath(value) {
   if (typeof value !== 'string' || !value.startsWith('/') || value.startsWith('//')) return null;
   const parsed = new URL(value, routeOrigin);
-  if (parsed.origin !== routeOrigin || !parsed.pathname.startsWith('/api/') || parsed.pathname === '/api/index') return null;
+  if (parsed.origin !== routeOrigin
+    || !parsed.pathname.startsWith('/api/')
+    || parsed.pathname === '/api/index'
+    || parsed.pathname.includes(':')
+    || parsed.pathname.includes('*')
+    || parsed.pathname.includes('[')
+    || parsed.pathname.includes(']')) return null;
   return parsed;
+}
+
+function pathFromRouteMatches(value) {
+  const directPath = parseApiPath(value);
+  if (directPath) return directPath;
+  if (typeof value !== 'string') return null;
+  const matches = new URLSearchParams(value);
+  for (const key of ['__pms_path', 'path', 'route', '1']) {
+    const matchedValue = matches.get(key);
+    if (typeof matchedValue !== 'string' || !matchedValue) continue;
+    const candidate = matchedValue.startsWith('/api/')
+      ? matchedValue
+      : `/api/${matchedValue.replace(/^\/+/, '')}`;
+    const parsed = parseApiPath(candidate);
+    if (parsed) return `${parsed.pathname}${parsed.search}`;
+  }
+  return null;
 }
 
 function safeRoute(value) {
@@ -32,13 +55,16 @@ module.exports = (request, response) => {
   const queryPath = firstString(url.searchParams.get('__pms_path')) || firstString(parsedQuery.__pms_path);
   const matchedPath = firstString(headers['x-matched-path']);
   const invokePath = firstString(headers['x-invoke-path']);
+  const vercelMatchedPath = firstString(headers['x-vercel-matched-path']);
   const routeMatches = firstString(headers['x-now-route-matches']);
+  const routeMatchPath = pathFromRouteMatches(routeMatches);
   const targetUrl = [
     queryPath,
     request.originalUrl,
+    vercelMatchedPath,
     matchedPath,
     invokePath,
-    routeMatches,
+    routeMatchPath,
     url.pathname
   ].map(parseApiPath).find(Boolean);
 
@@ -74,7 +100,8 @@ module.exports = (request, response) => {
       query: safeQuery,
       matchedPath: safeRoute(matchedPath),
       invokePath: safeRoute(invokePath),
-      routeMatches: routeMatches ? '[present]' : null,
+      vercelMatchedPath: safeRoute(vercelMatchedPath),
+      routeMatches: safeRoute(routeMatchPath) || (routeMatches ? '[present]' : null),
       resolvedRoute: targetUrl ? safeRoute(targetUrl.pathname) : safeRoute(url.pathname)
     });
   }
