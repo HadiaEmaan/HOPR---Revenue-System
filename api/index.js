@@ -61,6 +61,11 @@ function safeRoute(value) {
   return null;
 }
 
+function safePathSource(value) {
+  const resolvedPath = apiPathFromSource(value);
+  return resolvedPath ? safeRoute(resolvedPath.pathname) : safeRoute(value);
+}
+
 function safeRequestUrl(value) {
   let parsed;
   try {
@@ -76,27 +81,34 @@ function safeRequestUrl(value) {
   return `${parsed.pathname}${queryString ? `?${queryString}` : ''}`;
 }
 
-module.exports = (request, response) => {
-  const rawUrl = request.url || '/';
-  const url = new URL(rawUrl, `http://${request.headers.host || 'localhost'}`);
+function resolveRequestPath(request, url = new URL(request.url || '/', `http://${request.headers?.host || 'localhost'}`)) {
   const parsedQuery = request.query && typeof request.query === 'object' ? request.query : {};
   const headers = request.headers || {};
   const queryPath = firstString(url.searchParams.get('__pms_path')) || firstString(parsedQuery.__pms_path);
+  const candidates = [
+    queryPath,
+    apiPathFromSource(request.originalUrl),
+    apiPathFromSource(firstString(headers['x-vercel-matched-path'])),
+    apiPathFromSource(firstString(headers['x-matched-path'])),
+    apiPathFromSource(firstString(headers['x-invoke-path'])),
+    pathFromRouteMatches(firstString(headers['x-now-route-matches'])),
+    url.pathname
+  ];
+  return candidates.map(value => value instanceof URL ? value : parseApiPath(value)).find(Boolean) || url;
+}
+
+const handler = (request, response) => {
+  const rawUrl = request.url || '/';
+  const url = new URL(rawUrl, `http://${request.headers?.host || 'localhost'}`);
+  const parsedQuery = request.query && typeof request.query === 'object' ? request.query : {};
+  const queryPath = firstString(url.searchParams.get('__pms_path')) || firstString(parsedQuery.__pms_path);
+  const headers = request.headers || {};
   const matchedPath = firstString(headers['x-matched-path']);
   const invokePath = firstString(headers['x-invoke-path']);
   const vercelMatchedPath = firstString(headers['x-vercel-matched-path']);
   const routeMatches = firstString(headers['x-now-route-matches']);
   const routeMatchPath = pathFromRouteMatches(routeMatches);
-  const targetUrl = [
-    queryPath,
-    apiPathFromSource(request.originalUrl),
-    apiPathFromSource(vercelMatchedPath),
-    apiPathFromSource(matchedPath),
-    apiPathFromSource(invokePath),
-    routeMatchPath,
-    url.pathname
-  ].map(value => value instanceof URL ? value : parseApiPath(value)).find(Boolean);
-
+  const targetUrl = resolveRequestPath(request, url);
   const searchParams = new URLSearchParams(url.search);
   searchParams.delete('__pms_path');
   for (const [key, value] of Object.entries(parsedQuery)) {
@@ -122,19 +134,25 @@ module.exports = (request, response) => {
         : '[redacted]';
       return [key, key === '__pms_path' ? safeRoute(value) || '[invalid]' : value];
     }));
-    console.log('[pms-incoming-req]', {
+    console.log('[pms-incoming-req]', JSON.stringify({
       method: request.method,
-      rawUrl: safeRequestUrl(rawUrl),
-      url: safeRoute(url.pathname) || (url.pathname === '/api/index' ? '/api/index' : '[non-api]'),
-      originalUrl: safeRoute(request.originalUrl) || null,
+      url: safeRequestUrl(rawUrl),
+      originalUrl: request.originalUrl ? safeRequestUrl(request.originalUrl) : null,
       query: safeQuery,
-      matchedPath: safeRoute(matchedPath),
-      invokePath: safeRoute(invokePath),
-      vercelMatchedPath: safeRoute(vercelMatchedPath),
+      headers: {
+        matched: safePathSource(matchedPath),
+        invoke: safePathSource(invokePath),
+        vercelUrl: firstString(headers['x-vercel-deployment-url']) || null,
+        nowMatches: safeRoute(routeMatchPath) || (routeMatches ? '[present]' : null),
+        allKeys: Object.keys(headers)
+      },
       routeMatches: safeRoute(routeMatchPath) || (routeMatches ? '[present]' : null),
       resolvedRoute: targetUrl ? safeRoute(targetUrl.pathname) : safeRoute(url.pathname),
-      resolvedPathname: targetUrl ? targetUrl.pathname : url.pathname
-    });
+      resolvedPathname: targetUrl.pathname
+    }));
   }
   return serverHandler(request, response);
 };
+
+handler.resolveRequestPath = resolveRequestPath;
+module.exports = handler;

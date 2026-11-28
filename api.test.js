@@ -7,7 +7,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const net = require('node:net');
-const { spawn } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const { DatabaseSync } = require('node:sqlite');
 const { PDFDocument } = require('pdf-lib');
 
@@ -39,6 +39,37 @@ test('Vercel routes auth and initial workspace requests to their exact API paths
   }
   assert.equal(config.rewrites.at(-1).source, '/api/:path*');
   assert.equal(config.rewrites.at(-1).destination, '/api/index?__pms_path=/api/:path*');
+});
+
+test('API adapter resolves route paths when req.url is only /api/index', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hopr-pms-path-test-'));
+  try {
+    const requests = [
+      { url: '/api/index?__pms_path=%2Fapi%2Flogin', headers: {} },
+      { url: '/api/index', headers: { 'x-matched-path': '/api/login' } },
+      { url: '/api/index', headers: { 'x-invoke-path': '/api/setup-status' } },
+      { url: '/api/index', headers: { 'x-vercel-matched-path': '/api/index?__pms_path=%2Fapi%2Flogin' } },
+      { url: '/api/index', headers: { 'x-now-route-matches': '1=setup-status' } },
+      { url: '/api/index', query: { __pms_path: '/api/login' }, headers: {} }
+    ];
+    const resolverScript = "const handler = require('./api'); const requests = JSON.parse(process.argv[1]); console.log(JSON.stringify(requests.map(request => handler.resolveRequestPath(request).pathname)));";
+    const result = spawnSync(process.execPath, ['-e', resolverScript, JSON.stringify(requests)], {
+      cwd: __dirname,
+      env: { ...process.env, PMS_DB_PATH: path.join(tempDir, 'clinic.sqlite'), NODE_ENV: 'test' },
+      encoding: 'utf8'
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), [
+      '/api/login',
+      '/api/login',
+      '/api/setup-status',
+      '/api/login',
+      '/api/setup-status',
+      '/api/login'
+    ]);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
 });
 
 test('static pages remain available when database initialization fails', async t => {
@@ -168,7 +199,8 @@ test('server handler reconstructs rewritten setup-status and login routes', asyn
   for (const [header, value] of [
     ['x-matched-path', '/api/login'],
     ['x-invoke-path', '/api/index?__pms_path=%2Fapi%2Flogin'],
-    ['x-vercel-matched-path', '/api/index?__pms_path=%2Fapi%2Flogin']
+    ['x-vercel-matched-path', '/api/index?__pms_path=%2Fapi%2Flogin'],
+    ['x-now-route-matches', '1=login']
   ]) {
     const headerLoginResponse = await fetch(`${baseUrl}/api/index`, {
       method: 'POST',
