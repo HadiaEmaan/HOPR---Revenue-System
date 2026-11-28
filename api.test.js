@@ -89,6 +89,65 @@ test('static pages remain available when database initialization fails', async t
   assert.match(serverError, /stage: 'database initialization'/);
 });
 
+test('server handler reconstructs rewritten setup-status and login routes', async t => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hopr-pms-rewrite-test-'));
+  const port = await new Promise((resolve, reject) => {
+    const probe = net.createServer();
+    probe.once('error', reject);
+    probe.listen(0, '127.0.0.1', () => {
+      const selectedPort = probe.address().port;
+      probe.close(error => error ? reject(error) : resolve(selectedPort));
+    });
+  });
+  const serverBootstrap = "const http = require('node:http'); const handler = require('./server'); http.createServer(handler).listen(Number(process.env.PORT), '127.0.0.1');";
+  const childEnv = { ...process.env, PORT: String(port), PMS_DB_PATH: path.join(tempDir, 'clinic.sqlite'), NODE_ENV: 'test' };
+  delete childEnv.VERCEL;
+  delete childEnv.TURSO_DATABASE_URL;
+  delete childEnv.TURSO_AUTH_TOKEN;
+  delete childEnv.PMS_ADMIN_EMAIL;
+  delete childEnv.PMS_ADMIN_PASSWORD;
+  const child = spawn(process.execPath, ['-e', serverBootstrap], {
+    cwd: __dirname,
+    env: childEnv,
+    stdio: ['ignore', 'ignore', 'pipe']
+  });
+  let serverError = '';
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', chunk => { serverError += chunk; });
+  t.after(async () => {
+    if (child.exitCode === null) {
+      child.kill();
+      await new Promise(resolve => child.once('exit', resolve));
+    }
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  const baseUrl = `http://127.0.0.1:${port}`;
+  let ready = false;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (child.exitCode !== null) break;
+    try {
+      const response = await fetch(`${baseUrl}/api/index?__pms_path=%2Fapi%2Fsetup-status`);
+      if (response.status === 200) {
+        ready = true;
+        break;
+      }
+    } catch { await new Promise(resolve => setTimeout(resolve, 50)); }
+  }
+  assert.equal(ready, true, `handler did not start: ${serverError}`);
+
+  const setupStatusResponse = await fetch(`${baseUrl}/api/index?__pms_path=%2Fapi%2Fsetup-status`);
+  assert.equal(setupStatusResponse.status, 200);
+  assert.equal((await setupStatusResponse.json()).setupRequired, true);
+  const loginResponse = await fetch(`${baseUrl}/api/index?__pms_path=%2Fapi%2Flogin`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: 'missing@example.test', password: crypto.randomBytes(18).toString('base64url') })
+  });
+  assert.equal(loginResponse.status, 401);
+  assert.equal((await loginResponse.json()).error, 'Email or password is incorrect.');
+});
+
 test('server enforces sessions, roles, doctor scope and audit masking', async t => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hopr-pms-test-'));
   const password = crypto.randomBytes(18).toString('base64url');

@@ -2005,6 +2005,22 @@ async function handler(request, response) {
   let stage = 'request parsing';
   try {
     const url = new URL(requestPath, `http://${request.headers.host || 'localhost'}`);
+    const forwardedPath = url.searchParams.get('__pms_path');
+    if (forwardedPath) {
+      const originalUrl = new URL(forwardedPath, 'http://localhost');
+      if (originalUrl.origin === 'http://localhost'
+        && forwardedPath.startsWith('/api/')
+        && !forwardedPath.startsWith('//')) {
+        const searchParams = new URLSearchParams(url.search);
+        searchParams.delete('__pms_path');
+        for (const [key, value] of originalUrl.searchParams) {
+          if (!searchParams.has(key)) searchParams.append(key, value);
+        }
+        url.pathname = originalUrl.pathname;
+        url.search = searchParams.toString();
+        request.url = `${url.pathname}${url.search ? `?${url.searchParams}` : ''}`;
+      }
+    }
     requestPath = url.pathname;
     if (!url.pathname.startsWith('/api/')) {
       if (request.method !== 'GET' && request.method !== 'HEAD') return sendJson(response, 405, { error: 'Method not allowed.' });

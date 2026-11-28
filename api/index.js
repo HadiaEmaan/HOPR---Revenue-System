@@ -6,8 +6,8 @@ module.exports = (request, response) => {
   const url = new URL(request.url || '/', `http://${request.headers.host || 'localhost'}`);
   const parsedQuery = request.query && typeof request.query === 'object' ? request.query : {};
   const queryPath = parsedQuery.__pms_path;
-  const forwardedPath = url.searchParams.get('__pms_path')
-    || (Array.isArray(queryPath) ? queryPath[0] : queryPath);
+  const queryForwardedPath = Array.isArray(queryPath) ? queryPath[0] : queryPath;
+  const forwardedPath = url.searchParams.get('__pms_path') || queryForwardedPath;
   let targetPath = url.pathname;
   let resolvedRoute = url.pathname;
   if (typeof forwardedPath === 'string') {
@@ -26,6 +26,9 @@ module.exports = (request, response) => {
         for (const item of Array.isArray(value) ? value : [value]) {
           if (typeof item === 'string') searchParams.append(key, item);
         }
+      }
+      for (const [key, value] of originalUrl.searchParams) {
+        if (!searchParams.has(key)) searchParams.append(key, value);
       }
       request.url = `${originalUrl.pathname}${searchParams.size ? `?${searchParams}` : ''}`;
     }
