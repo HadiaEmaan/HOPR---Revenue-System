@@ -16,6 +16,16 @@ const rootCandidates = [...new Set([
   path.resolve(process.cwd(), 'PMS')
 ])];
 const root = rootCandidates.find(candidate => fs.existsSync(path.resolve(candidate, 'index.html'))) || __dirname;
+const staticRootCandidates = [...new Set([
+  root,
+  __dirname,
+  path.resolve(__dirname, 'api'),
+  path.resolve(__dirname, '..'),
+  path.resolve(__dirname, '..', '..'),
+  process.cwd(),
+  path.resolve(process.cwd(), 'api'),
+  path.resolve(process.cwd(), 'PMS')
+])];
 const dataDir = path.join(root, 'data');
 const dbPath = process.env.PMS_DB_PATH || path.join(dataDir, 'clinic.sqlite');
 const assessmentTemplatePath = path.join(root, 'Patient History & Assessment Form.pdf');
@@ -27,7 +37,13 @@ if (process.env.VERCEL) {
     workingDir: process.cwd(),
     selectedRoot: root,
     indexPath: path.resolve(root, 'index.html'),
-    indexExists: fs.existsSync(path.resolve(root, 'index.html'))
+    indexExists: fs.existsSync(path.resolve(root, 'index.html')),
+    indexCandidates: staticRootCandidates.map(candidate => ({
+      root: candidate,
+      indexExists: fs.existsSync(path.resolve(candidate, 'index.html'))
+    })),
+    taskRootEntries: fs.existsSync('/var/task') ? fs.readdirSync('/var/task') : null,
+    taskApiEntries: fs.existsSync('/var/task/api') ? fs.readdirSync('/var/task/api') : null
   });
 }
 if (process.env.VERCEL && (!process.env.TURSO_DATABASE_URL || !process.env.TURSO_AUTH_TOKEN)) {
@@ -1888,19 +1904,20 @@ function serveStatic(request, response, url) {
     response.writeHead(204, { 'Cache-Control': 'public, max-age=86400' });
     return response.end();
   }
-  const publicFiles = new Map([
-    ['index.html', path.resolve(root, 'index.html')],
-    ['styles.css', path.resolve(root, 'styles.css')],
-    ['secure-app.js', path.resolve(root, 'secure-app.js')],
-    ['hopr.jpeg', path.resolve(root, 'hopr.jpeg')],
-    ['gymkhana.png', path.resolve(root, 'gymkhana.png')],
-    ['invoice.png', path.resolve(root, 'invoice.png')],
-    ['clinic.jpeg', path.resolve(root, 'clinic.jpeg')]
+  const publicFiles = new Set([
+    'index.html',
+    'styles.css',
+    'secure-app.js',
+    'hopr.jpeg',
+    'gymkhana.png',
+    'invoice.png',
+    'clinic.jpeg'
   ]);
-  const filePath = publicFiles.get(requested);
-  if (!filePath) return sendJson(response, 404, { error: 'Not found.' });
-  if (!fs.existsSync(filePath)) {
-    console.error('[pms-static-missing]', { requested, root, filePath, workingDir: process.cwd() });
+  if (!publicFiles.has(requested)) return sendJson(response, 404, { error: 'Not found.' });
+  const searchedPaths = staticRootCandidates.map(candidate => path.resolve(candidate, requested));
+  const filePath = searchedPaths.find(candidate => fs.existsSync(candidate));
+  if (!filePath) {
+    console.error('[pms-static-missing]', { requested, root, searchedPaths, workingDir: process.cwd() });
     return sendJson(response, 404, { error: 'Not found.' });
   }
   fs.readFile(filePath, (error, content) => {
