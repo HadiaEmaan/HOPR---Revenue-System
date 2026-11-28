@@ -45,9 +45,9 @@ Vercel can serve the PMS on demand, but serverless functions do not run continuo
    - `TURSO_DATABASE_URL` = the database URL beginning with `libsql://`
    - `TURSO_AUTH_TOKEN` = the Turso auth token (**Sensitive**)
    - `PMS_PUBLIC_ORIGIN` = the exact public HTTPS origin, without a trailing slash (for example `https://your-project.vercel.app`)
-   - `PMS_ADMIN_EMAIL` and `PMS_ADMIN_PASSWORD` as **Sensitive** variables for initial admin creation only; use a unique password of at least 14 characters.
+   - `PMS_ADMIN_EMAIL` and `PMS_ADMIN_PASSWORD` as **Sensitive** variables for one-time admin bootstrap; if that email already belongs to a user, bootstrap promotes/reactivates that account, sets this password, and revokes its sessions. Use a unique password of at least 14 characters.
    - `PMS_TIME_ZONE` = `Asia/Karachi` (optional; this is already the default)
-4. Deploy. The first function request creates the schema and the initial admin account. Sign in, then remove `PMS_ADMIN_EMAIL` and `PMS_ADMIN_PASSWORD` from Vercel and redeploy. Keep the Turso URL/token configured.
+4. Deploy. The first function request creates the schema and bootstraps the admin account. Sign in, then immediately remove `PMS_ADMIN_EMAIL` and `PMS_ADMIN_PASSWORD` from Vercel and redeploy; leaving them configured repeats the password reset and revokes that account's sessions on each new function instance. Keep the Turso URL/token configured.
 5. Test login, role-based pages, assessment PDF preview, and an authorized write action after deployment.
 
 Session tokens are stored as SHA-256 hashes in Turso and survive function restarts; expiry remains 12 hours. Assessment answer JSON is stored in Turso, and PDF files are regenerated for authenticated download instead of written to function disk. Do not copy patient data into Git or enable public access to the Turso database. Confirm Vercel and Turso privacy, retention, access-control, backup, and applicable health-data requirements before using real records. Vercel may cold-start or pause functions, so it is not an always-on server or a background-job host.

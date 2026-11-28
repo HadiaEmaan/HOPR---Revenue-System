@@ -31,6 +31,55 @@ test('Vercel-bundled static assets stay in sync with root assets', () => {
   }
 });
 
+test('static pages remain available when database initialization fails', async t => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hopr-pms-static-test-'));
+  const databasePath = path.join(tempDir, 'broken.sqlite');
+  fs.writeFileSync(databasePath, 'not a sqlite database');
+  const port = await new Promise((resolve, reject) => {
+    const probe = net.createServer();
+    probe.once('error', reject);
+    probe.listen(0, '127.0.0.1', () => {
+      const selectedPort = probe.address().port;
+      probe.close(error => error ? reject(error) : resolve(selectedPort));
+    });
+  });
+  const serverBootstrap = "const http = require('node:http'); const handler = require('./api'); http.createServer(handler).listen(Number(process.env.PORT), '127.0.0.1');";
+  const child = spawn(process.execPath, ['-e', serverBootstrap], {
+    cwd: __dirname,
+    env: { ...process.env, PORT: String(port), PMS_DB_PATH: databasePath, NODE_ENV: 'test' },
+    stdio: ['ignore', 'ignore', 'pipe']
+  });
+  let serverError = '';
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', chunk => { serverError += chunk; });
+  t.after(async () => {
+    if (child.exitCode === null) {
+      child.kill();
+      await new Promise(resolve => child.once('exit', resolve));
+    }
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  const baseUrl = `http://127.0.0.1:${port}`;
+  let ready = false;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (child.exitCode !== null) break;
+    try {
+      await fetch(baseUrl);
+      ready = true;
+      break;
+    } catch { await new Promise(resolve => setTimeout(resolve, 50)); }
+  }
+  assert.equal(ready, true, `server did not start: ${serverError}`);
+  const page = await fetch(baseUrl);
+  assert.equal(page.status, 200);
+  assert.match(await page.text(), /HOPR/);
+  const apiResponse = await fetch(`${baseUrl}/api/setup-status`);
+  assert.equal(apiResponse.status, 500);
+  assert.match(serverError, /\[pms-request-error\]/);
+  assert.match(serverError, /stage: 'database initialization'/);
+});
+
 test('server enforces sessions, roles, doctor scope and audit masking', async t => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hopr-pms-test-'));
   const password = crypto.randomBytes(18).toString('base64url');
@@ -45,10 +94,10 @@ test('server enforces sessions, roles, doctor scope and audit masking', async t 
   let child;
   let serverError = '';
   const serverBootstrap = "const http = require('node:http'); const handler = require('./api'); http.createServer((request, response) => { const url = new URL(request.url, 'http://localhost'); request.query = Object.fromEntries(url.searchParams); url.searchParams.delete('__pms_path'); request.url = url.pathname + url.search; handler(request, response); }).listen(Number(process.env.PORT), process.env.HOST);";
-  const startServer = () => {
+  const startServer = (extraEnv = {}) => {
     const childProcess = spawn(process.execPath, ['-e', serverBootstrap], {
       cwd: __dirname,
-      env: { ...process.env, PORT: String(port), HOST: '0.0.0.0', PMS_DB_PATH: path.join(tempDir, 'clinic.sqlite'), NODE_ENV: 'test' },
+      env: { ...process.env, PORT: String(port), HOST: '0.0.0.0', PMS_DB_PATH: path.join(tempDir, 'clinic.sqlite'), NODE_ENV: 'test', ...extraEnv },
       stdio: ['ignore', 'ignore', 'pipe']
     });
     childProcess.stderr.setEncoding('utf8');
@@ -134,7 +183,9 @@ test('server enforces sessions, roles, doctor scope and audit masking', async t 
   const gymkhanaLogo = await vercelFetch(`${baseUrl}/gymkhana.png`);
   assert.equal(gymkhanaLogo.status, 200);
   assert.match(gymkhanaLogo.headers.get('content-type'), /image\/png/);
-  assert.equal((await request('/api/setup-status')).body.setupRequired, true);
+  const setupStatus = await request('/api/setup-status');
+  assert.equal(setupStatus.response.status, 200);
+  assert.equal(setupStatus.body.setupRequired, true);
   const setup = await request('/api/setup', { method: 'POST', body: JSON.stringify({ name: 'Clinic Admin', email: 'admin@example.test', password }) });
   assert.equal(setup.response.status, 201, JSON.stringify(setup.body));
   let adminCookie = setup.cookie;
@@ -1111,4 +1162,48 @@ test('server enforces sessions, roles, doctor scope and audit masking', async t 
   assert.equal((await request('/api/login', {
     method: 'POST', body: JSON.stringify({ email: manager.email, password: staffResetPassword })
   })).response.status, 200);
+
+  const beforeBootstrapLogin = await request('/api/login', {
+    method: 'POST', body: JSON.stringify({ email: manager.email, password: staffResetPassword })
+  });
+  assert.equal(beforeBootstrapLogin.response.status, 200);
+  const promotedPassword = crypto.randomBytes(24).toString('base64url');
+  const promotionDb = new DatabaseSync(path.join(tempDir, 'clinic.sqlite'));
+  promotionDb.prepare('UPDATE users SET email = ?, active = 0 WHERE id = ?').run(manager.email.toUpperCase(), manager.id);
+  promotionDb.close();
+
+  const previousProcess = child;
+  const previousProcessExit = new Promise(resolve => previousProcess.once('exit', resolve));
+  previousProcess.kill();
+  await previousProcessExit;
+  child = startServer({ PMS_ADMIN_EMAIL: manager.email, PMS_ADMIN_PASSWORD: promotedPassword });
+  ready = false;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (child.exitCode !== null) break;
+    try {
+      const response = await fetch(`${baseUrl}/api/session`);
+      if (response.status === 401) {
+        ready = true;
+        break;
+      }
+    } catch { await new Promise(resolve => setTimeout(resolve, 50)); }
+  }
+  assert.equal(ready, true, `server did not finish admin bootstrap: ${serverError}`);
+  const revokedPromotedSession = await request('/api/session', { cookie: beforeBootstrapLogin.cookie });
+  assert.equal(revokedPromotedSession.response.status, 401);
+  const verifiedPromotionDb = new DatabaseSync(path.join(tempDir, 'clinic.sqlite'));
+  const promotedAccount = verifiedPromotionDb.prepare('SELECT role, active FROM users WHERE id = ?').get(manager.id);
+  const remainingSessions = verifiedPromotionDb.prepare('SELECT COUNT(*) AS count FROM sessions WHERE user_id = ?').get(manager.id).count;
+  verifiedPromotionDb.close();
+  assert.equal(promotedAccount.role, 'admin');
+  assert.equal(promotedAccount.active, 1);
+  assert.equal(remainingSessions, 0);
+  const promotedLogin = await request('/api/login', {
+    method: 'POST', body: JSON.stringify({ email: manager.email, password: promotedPassword })
+  });
+  assert.equal(promotedLogin.response.status, 200);
+  assert.equal(promotedLogin.body.user.role, 'admin');
+  assert.equal((await request('/api/login', {
+    method: 'POST', body: JSON.stringify({ email: manager.email, password: staffResetPassword })
+  })).response.status, 401);
 });

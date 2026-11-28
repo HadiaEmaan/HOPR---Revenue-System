@@ -9,11 +9,15 @@ module.exports = (request, response) => {
   const forwardedPath = url.searchParams.get('__pms_path')
     || (Array.isArray(queryPath) ? queryPath[0] : queryPath);
   let targetPath = url.pathname;
+  let resolvedRoute = url.pathname;
   if (typeof forwardedPath === 'string') {
     const originalUrl = new URL(forwardedPath, 'http://localhost');
     if (originalUrl.origin === 'http://localhost'
       && forwardedPath.startsWith('/')
       && !forwardedPath.startsWith('//')) {
+      resolvedRoute = originalUrl.pathname.startsWith('/api/')
+        ? `/api/${originalUrl.pathname.split('/')[2] || ''}`
+        : originalUrl.pathname;
       targetPath = originalUrl.pathname.startsWith('/api/') ? '/api/[route]' : originalUrl.pathname;
       const searchParams = new URLSearchParams(url.search);
       searchParams.delete('__pms_path');
@@ -35,6 +39,7 @@ module.exports = (request, response) => {
     console.log('[pms-vercel-request]', {
       reqUrl: `${url.pathname}${url.search ? '?<redacted>' : ''}`,
       reqQuery: safeQuery,
+      resolvedRoute,
       resolvedTarget: targetPath
     });
   }

@@ -405,6 +405,14 @@ const dbReady = requestContext.run({ transaction: null }, async () => {
   await initializeSchema();
   await bootstrapAdmin();
 });
+dbReady.catch(error => {
+  console.error('[pms-database-initialization-failed]', {
+    errorName: error.name,
+    errorCode: error.code,
+    message: error.message,
+    stack: error.stack
+  });
+});
 
 function makeId(prefix) { return `${prefix}_${crypto.randomUUID()}`; }
 function passwordDigest(password, salt) { return crypto.pbkdf2Sync(password, salt, 310000, 32, 'sha256').toString('hex'); }
@@ -443,18 +451,49 @@ async function revokeUserSessions(userId) {
 async function bootstrapAdmin() {
   const email = process.env.PMS_ADMIN_EMAIL?.trim().toLowerCase();
   const password = process.env.PMS_ADMIN_PASSWORD;
-  if (!email && !password) return;
+  if (!email && !password) {
+    const existingAdmin = await db.prepare('SELECT id FROM users WHERE role = ? LIMIT 1').get('admin');
+    if (!existingAdmin && process.env.VERCEL) {
+      console.warn('[pms-admin-bootstrap]', {
+        outcome: 'skipped',
+        reason: 'No admin exists and PMS_ADMIN_EMAIL/PMS_ADMIN_PASSWORD are not configured.'
+      });
+    }
+    return;
+  }
   if (!email || !password || password.length < 14) {
     throw new Error('Set both PMS_ADMIN_EMAIL and PMS_ADMIN_PASSWORD (at least 14 characters).');
   }
-  const existing = await db.prepare('SELECT id FROM users WHERE role = ? LIMIT 1').get('admin');
-  if (existing) return;
-  const id = makeId('usr');
   const salt = crypto.randomBytes(16).toString('hex');
-  await db.prepare('INSERT INTO users (id, email, name, role, password_hash, password_salt) VALUES (?, ?, ?, ?, ?, ?)')
-    .run(id, email, email.split('@')[0], 'admin', passwordDigest(password, salt), salt);
-  await audit(id, 'bootstrap', 'user', id);
-  console.log(`Initial admin account created for ${email}.`);
+  const passwordHash = passwordDigest(password, salt);
+  let outcome;
+  await db.exec('BEGIN IMMEDIATE');
+  try {
+    const matchingUser = await db.prepare('SELECT id FROM users WHERE email = ? COLLATE NOCASE LIMIT 1').get(email);
+    if (matchingUser) {
+      await db.prepare("UPDATE users SET email = ?, role = 'admin', active = 1, password_hash = ?, password_salt = ? WHERE id = ?")
+        .run(email, passwordHash, salt, matchingUser.id);
+      await revokeUserSessions(matchingUser.id);
+      await audit(matchingUser.id, 'bootstrap_admin_reset', 'user', matchingUser.id);
+      outcome = 'updated_existing_user';
+    } else {
+      const existingAdmin = await db.prepare('SELECT id FROM users WHERE role = ? LIMIT 1').get('admin');
+      if (existingAdmin) {
+        outcome = 'existing_admin_preserved';
+      } else {
+        const id = makeId('usr');
+        await db.prepare('INSERT INTO users (id, email, name, role, password_hash, password_salt) VALUES (?, ?, ?, ?, ?, ?)')
+          .run(id, email, email.split('@')[0], 'admin', passwordHash, salt);
+        await audit(id, 'bootstrap', 'user', id);
+        outcome = 'created_initial_admin';
+      }
+    }
+    await db.exec('COMMIT');
+  } catch (error) {
+    if (db.isTransaction) await db.exec('ROLLBACK');
+    throw error;
+  }
+  if (process.env.VERCEL) console.info('[pms-admin-bootstrap]', { outcome });
 }
 
 function sendJson(response, status, data, headers = {}) {
@@ -979,7 +1018,16 @@ async function routeApi(request, response, url) {
 
   if (url.pathname === '/api/setup-status' && request.method === 'GET') {
     const adminExists = Boolean(await db.prepare("SELECT id FROM users WHERE role = 'admin' LIMIT 1").get());
-    return sendJson(response, 200, { setupRequired: !adminExists && process.env.NODE_ENV !== 'production' });
+    const setupRequired = !adminExists && process.env.NODE_ENV !== 'production';
+    if (process.env.VERCEL) {
+      console.info('[pms-setup-status]', {
+        outcome: 'ok',
+        adminExists,
+        setupRequired,
+        database: process.env.TURSO_DATABASE_URL ? 'turso' : 'local'
+      });
+    }
+    return sendJson(response, 200, { setupRequired });
   }
 
   if (url.pathname === '/api/setup' && request.method === 'POST') {
@@ -1024,6 +1072,12 @@ async function routeApi(request, response, url) {
     const candidate = passwordDigest(password.slice(0, 256), user?.password_salt || 'invalid-account-salt');
     const valid = Boolean(user && crypto.timingSafeEqual(Buffer.from(candidate, 'hex'), Buffer.from(user.password_hash, 'hex')));
     if (!valid) {
+      if (process.env.VERCEL) {
+        console.warn('[pms-login-rejected]', {
+          reason: user ? 'password_mismatch' : 'account_not_found',
+          accountFingerprint: crypto.createHash('sha256').update(email).digest('hex').slice(0, 12)
+        });
+      }
       await recordLoginFailure(key);
       return sendJson(response, 401, { error: 'Email or password is incorrect.' });
     }
@@ -1952,12 +2006,14 @@ async function handler(request, response) {
   try {
     const url = new URL(requestPath, `http://${request.headers.host || 'localhost'}`);
     requestPath = url.pathname;
+    if (!url.pathname.startsWith('/api/')) {
+      if (request.method !== 'GET' && request.method !== 'HEAD') return sendJson(response, 405, { error: 'Method not allowed.' });
+      return serveStatic(request, response, url);
+    }
     stage = 'database initialization';
     await dbReady;
     stage = 'request handling';
-    if (url.pathname.startsWith('/api/')) return await routeApi(request, response, url);
-    if (request.method !== 'GET' && request.method !== 'HEAD') return sendJson(response, 405, { error: 'Method not allowed.' });
-    return serveStatic(request, response, url);
+    return await routeApi(request, response, url);
   } catch (error) {
     const status = error.status || 500;
     if (status === 500) {
