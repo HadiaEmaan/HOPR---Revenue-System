@@ -2,7 +2,16 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "functions": {
     "api/index.js": {
-      "includeFiles": "*.{html,css,js,jpeg,jpg,png,pdf}"
+      "includeFiles": [
+        "index.html",
+        "styles.css",
+        "secure-app.js",
+        "hopr.jpeg",
+        "gymkhana.png",
+        "invoice.png",
+        "clinic.jpeg",
+        "Patient History & Assessment Form.pdf"
+      ]
     }
   },
   "rewrites": [
