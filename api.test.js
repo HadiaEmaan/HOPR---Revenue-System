@@ -11,6 +11,26 @@ const { spawn } = require('node:child_process');
 const { DatabaseSync } = require('node:sqlite');
 const { PDFDocument } = require('pdf-lib');
 
+test('Vercel-bundled static assets stay in sync with root assets', () => {
+  const assetNames = [
+    'index.html',
+    'styles.css',
+    'secure-app.js',
+    'hopr.jpeg',
+    'gymkhana.png',
+    'invoice.png',
+    'clinic.jpeg',
+    'Patient History & Assessment Form.pdf'
+  ];
+  for (const assetName of assetNames) {
+    assert.deepEqual(
+      fs.readFileSync(path.join(__dirname, assetName)),
+      fs.readFileSync(path.join(__dirname, 'api', 'static', assetName)),
+      `${assetName} must match its Vercel-bundled copy`
+    );
+  }
+});
+
 test('server enforces sessions, roles, doctor scope and audit masking', async t => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hopr-pms-test-'));
   const password = crypto.randomBytes(18).toString('base64url');

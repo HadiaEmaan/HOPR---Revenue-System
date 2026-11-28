@@ -9,6 +9,16 @@ const { pathToFileURL } = require('node:url');
 const { createClient } = require('@libsql/client');
 const { PDFDocument, StandardFonts, rgb } = require('pdf-lib');
 
+const bundledStaticFiles = new Map([
+  ['index.html', require.resolve('./api/static/index.html')],
+  ['styles.css', require.resolve('./api/static/styles.css')],
+  ['secure-app.js', require.resolve('./api/static/secure-app.js')],
+  ['hopr.jpeg', require.resolve('./api/static/hopr.jpeg')],
+  ['gymkhana.png', require.resolve('./api/static/gymkhana.png')],
+  ['invoice.png', require.resolve('./api/static/invoice.png')],
+  ['clinic.jpeg', require.resolve('./api/static/clinic.jpeg')],
+  ['Patient History & Assessment Form.pdf', require.resolve('./api/static/Patient History & Assessment Form.pdf')]
+]);
 const rootCandidates = [...new Set([
   __dirname,
   process.cwd(),
@@ -21,6 +31,7 @@ const rootCandidates = [...new Set([
 ])];
 const root = rootCandidates.find(candidate => fs.existsSync(path.resolve(candidate, 'index.html'))) || __dirname;
 const staticRootCandidates = [...new Set([
+  path.resolve(__dirname, 'api', 'static'),
   root,
   ...rootCandidates,
   __dirname,
@@ -30,7 +41,7 @@ const staticRootCandidates = [...new Set([
 ])];
 const dataDir = path.join(root, 'data');
 const dbPath = process.env.PMS_DB_PATH || path.join(dataDir, 'clinic.sqlite');
-const assessmentTemplatePath = path.join(root, 'Patient History & Assessment Form.pdf');
+const assessmentTemplatePath = bundledStaticFiles.get('Patient History & Assessment Form.pdf');
 const port = Number(process.env.PORT || 7860);
 const host = process.env.HOST || '0.0.0.0';
 if (process.env.VERCEL) {
@@ -38,14 +49,20 @@ if (process.env.VERCEL) {
     moduleDir: __dirname,
     workingDir: process.cwd(),
     selectedRoot: root,
-    indexPath: path.resolve(root, 'index.html'),
-    indexExists: fs.existsSync(path.resolve(root, 'index.html')),
+    indexPath: bundledStaticFiles.get('index.html'),
+    indexExists: fs.existsSync(bundledStaticFiles.get('index.html')),
+    selectedRootIndexExists: fs.existsSync(path.resolve(root, 'index.html')),
     indexCandidates: staticRootCandidates.map(candidate => ({
       root: candidate,
       indexExists: fs.existsSync(path.resolve(candidate, 'index.html'))
     })),
+    bundledStaticFiles: Object.fromEntries([...bundledStaticFiles].map(([name, filePath]) => [
+      name,
+      { filePath, exists: fs.existsSync(filePath) }
+    ])),
     taskRootEntries: fs.existsSync('/var/task') ? fs.readdirSync('/var/task') : 'missing',
-    taskApiEntries: fs.existsSync('/var/task/api') ? fs.readdirSync('/var/task/api') : 'missing'
+    taskApiEntries: fs.existsSync('/var/task/api') ? fs.readdirSync('/var/task/api') : 'missing',
+    taskApiStaticEntries: fs.existsSync('/var/task/api/static') ? fs.readdirSync('/var/task/api/static') : 'missing'
   });
 }
 if (process.env.VERCEL && (!process.env.TURSO_DATABASE_URL || !process.env.TURSO_AUTH_TOKEN)) {
@@ -1906,31 +1923,23 @@ function serveStatic(request, response, url) {
     response.writeHead(204, { 'Cache-Control': 'public, max-age=86400' });
     return response.end();
   }
-  const publicFiles = new Set([
-    'index.html',
-    'styles.css',
-    'secure-app.js',
-    'hopr.jpeg',
-    'gymkhana.png',
-    'invoice.png',
-    'clinic.jpeg'
-  ]);
-  if (!publicFiles.has(requested)) return sendJson(response, 404, { error: 'Not found.' });
-  const searchedPaths = staticRootCandidates.map(candidate => path.resolve(candidate, requested));
-  const filePath = searchedPaths.find(candidate => fs.existsSync(candidate));
-  if (!filePath) {
+  if (!bundledStaticFiles.has(requested) || requested.endsWith('.pdf')) return sendJson(response, 404, { error: 'Not found.' });
+  const filePath = bundledStaticFiles.get(requested);
+  const searchedPaths = [filePath, ...staticRootCandidates.map(candidate => path.resolve(candidate, requested))];
+  const resolvedFilePath = searchedPaths.find(candidate => fs.existsSync(candidate));
+  if (!resolvedFilePath) {
     console.error('[pms-static-missing]', { requested, root, searchedPaths, workingDir: process.cwd() });
     return sendJson(response, 404, { error: 'Not found.' });
   }
-  fs.readFile(filePath, (error, content) => {
+  fs.readFile(resolvedFilePath, (error, content) => {
     if (error) {
-      console.error('[pms-static-read-failed]', { requested, root, filePath, message: error.message });
+      console.error('[pms-static-read-failed]', { requested, root, filePath: resolvedFilePath, message: error.message });
       return sendJson(response, 404, { error: 'Not found.' });
     }
-    const cacheControl = ['.js', '.css'].includes(path.extname(filePath)) || filePath.endsWith('index.html')
+    const cacheControl = ['.js', '.css'].includes(path.extname(resolvedFilePath)) || resolvedFilePath.endsWith('index.html')
       ? 'no-cache'
       : 'public, max-age=300';
-    response.writeHead(200, { 'Content-Type': mimeTypes[path.extname(filePath)] || 'application/octet-stream', 'Cache-Control': cacheControl, ...contentSecurityHeaders() });
+    response.writeHead(200, { 'Content-Type': mimeTypes[path.extname(resolvedFilePath)] || 'application/octet-stream', 'Cache-Control': cacheControl, ...contentSecurityHeaders() });
     response.end(content);
   });
 }

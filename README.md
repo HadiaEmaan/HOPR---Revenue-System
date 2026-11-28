@@ -40,7 +40,7 @@ The local first-run setup screen is disabled when `NODE_ENV=production`. For a p
 Vercel can serve the PMS on demand, but serverless functions do not run continuously in the background. The app now uses Turso/libSQL for cloud data and durable sessions, and generates assessment PDFs in memory. A new Vercel deployment starts with an **empty Turso database**; this setup does not import the existing local SQLite clinic records.
 
 1. Create a Turso database and generate an authentication token with read/write access.
-2. Import the `PMS` repository as a Vercel project and keep Root Directory at the repository root (the `PMS` folder in this workspace). Vercel serves `/`, `/index.html`, the browser JS/CSS, and images directly as static files from the repository root. Only `/api/*` is rewritten to the shared Node.js function, with its original path preserved. The assessment PDF template is bundled with that function but is not publicly served.
+2. Import the `PMS` repository as a Vercel project and keep Root Directory at the repository root (the `PMS` folder in this workspace). `/` and the browser JS/CSS and images are served by the shared Node.js function; `/api/*` is also rewritten to that function with its original path preserved. Function-bundled copies live under `api/static/` and are referenced directly by `server.js`; update those copies whenever changing the corresponding repository-root assets. `vercel.json` does not use a broad `includeFiles` glob. The assessment PDF template is bundled with the function but is not publicly served.
 3. In Vercel **Project Settings → Environment Variables**, add:
    - `TURSO_DATABASE_URL` = the database URL beginning with `libsql://`
    - `TURSO_AUTH_TOKEN` = the Turso auth token (**Sensitive**)
