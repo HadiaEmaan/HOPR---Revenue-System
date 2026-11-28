@@ -38,6 +38,7 @@ test('Vercel routes auth and initial workspace requests to their exact API paths
     assert.equal(rewrites.get(route), `/api/index?__pms_path=${route}`);
   }
   assert.equal(config.rewrites.at(-1).source, '/api/:path*');
+  assert.equal(config.rewrites.at(-1).destination, '/api/index?__pms_path=/api/:path*');
 });
 
 test('static pages remain available when database initialization fails', async t => {
@@ -99,7 +100,7 @@ test('server handler reconstructs rewritten setup-status and login routes', asyn
       probe.close(error => error ? reject(error) : resolve(selectedPort));
     });
   });
-  const serverBootstrap = "const http = require('node:http'); const handler = require('./server'); http.createServer(handler).listen(Number(process.env.PORT), '127.0.0.1');";
+  const serverBootstrap = "const http = require('node:http'); const handler = require('./server'); http.createServer((request, response) => { if (request.headers['x-test-query-only']) { const url = new URL(request.url, 'http://localhost'); request.query = Object.fromEntries(url.searchParams); url.searchParams.delete('__pms_path'); request.url = url.pathname + url.search; } handler(request, response); }).listen(Number(process.env.PORT), '127.0.0.1');";
   const childEnv = { ...process.env, PORT: String(port), PMS_DB_PATH: path.join(tempDir, 'clinic.sqlite'), NODE_ENV: 'test' };
   delete childEnv.VERCEL;
   delete childEnv.TURSO_DATABASE_URL;
@@ -139,6 +140,11 @@ test('server handler reconstructs rewritten setup-status and login routes', asyn
   const setupStatusResponse = await fetch(`${baseUrl}/api/index?__pms_path=%2Fapi%2Fsetup-status`);
   assert.equal(setupStatusResponse.status, 200);
   assert.equal((await setupStatusResponse.json()).setupRequired, true);
+  const parsedQuerySetupStatus = await fetch(`${baseUrl}/api/index?__pms_path=%2Fapi%2Fsetup-status`, {
+    headers: { 'x-test-query-only': 'true' }
+  });
+  assert.equal(parsedQuerySetupStatus.status, 200);
+  assert.equal((await parsedQuerySetupStatus.json()).setupRequired, true);
   const loginResponse = await fetch(`${baseUrl}/api/index?__pms_path=%2Fapi%2Flogin`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -254,6 +260,11 @@ test('server enforces sessions, roles, doctor scope and audit masking', async t 
   const setupStatus = await request('/api/setup-status');
   assert.equal(setupStatus.response.status, 200);
   assert.equal(setupStatus.body.setupRequired, true);
+  const matchedPathSetupStatus = await fetch(`${baseUrl}/api/index`, {
+    headers: { 'x-matched-path': '/api/setup-status' }
+  });
+  assert.equal(matchedPathSetupStatus.status, 200);
+  assert.equal((await matchedPathSetupStatus.json()).setupRequired, true);
   const setup = await request('/api/setup', { method: 'POST', body: JSON.stringify({ name: 'Clinic Admin', email: 'admin@example.test', password }) });
   assert.equal(setup.response.status, 201, JSON.stringify(setup.body));
   let adminCookie = setup.cookie;

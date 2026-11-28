@@ -2005,14 +2005,23 @@ async function handler(request, response) {
   let stage = 'request parsing';
   try {
     const url = new URL(requestPath, `http://${request.headers.host || 'localhost'}`);
-    const forwardedPath = url.searchParams.get('__pms_path');
-    if (forwardedPath) {
+    const requestQuery = request.query && typeof request.query === 'object' ? request.query : {};
+    const queryPath = requestQuery.__pms_path;
+    const forwardedPath = url.searchParams.get('__pms_path')
+      || (Array.isArray(queryPath) ? queryPath[0] : queryPath);
+    if (typeof forwardedPath === 'string' && forwardedPath) {
       const originalUrl = new URL(forwardedPath, 'http://localhost');
       if (originalUrl.origin === 'http://localhost'
         && forwardedPath.startsWith('/api/')
         && !forwardedPath.startsWith('//')) {
         const searchParams = new URLSearchParams(url.search);
         searchParams.delete('__pms_path');
+        for (const [key, value] of Object.entries(requestQuery)) {
+          if (key === '__pms_path' || searchParams.has(key)) continue;
+          for (const item of Array.isArray(value) ? value : [value]) {
+            if (typeof item === 'string') searchParams.append(key, item);
+          }
+        }
         for (const [key, value] of originalUrl.searchParams) {
           if (!searchParams.has(key)) searchParams.append(key, value);
         }
